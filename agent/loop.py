@@ -1,6 +1,7 @@
 import asyncio
 import json
-from typing import AsyncGenerator, Callable, Awaitable, Any
+import logging
+from typing import AsyncGenerator, Callable, Awaitable, Any, TYPE_CHECKING
 
 from .state import LoopState, Message
 from .events import (
@@ -12,7 +13,17 @@ from .llm import LLM, ContextOverflowError
 from .tools import ToolRegistry, StreamingExecutor, CanUseToolFn
 from .compact import maybe_compact
 
+if TYPE_CHECKING:
+    from .memory.store import MemoryStore
+
+logger = logging.getLogger(__name__)
+
 TOOL_LOOP_REPEAT_THRESHOLD = 3
+
+
+def _default_store() -> "MemoryStore":
+    from .memory import MemPalaceStore
+    return MemPalaceStore()
 
 
 def _is_repeating(messages: tuple[Message, ...], current_calls: list[ToolCall]) -> bool:
@@ -56,6 +67,7 @@ async def run(
     on_turn_end: Callable[[LoopState], Awaitable[None]] | None = None,
     signal: asyncio.Event | None = None,
     expose_tool_errors: bool = False,
+    memory_store: "MemoryStore | None" = None,
 ) -> AsyncGenerator[Any, None]:
     """
     Stream agent events until a Terminal event.
@@ -65,19 +77,47 @@ async def run(
             MaxTurnsReached, ToolLoopDetected, Terminal.
     Terminal reasons: completed, max_turns, aborted, model_error, context_overflow, tool_loop.
     """
+    if memory_store is None:
+        memory_store = _default_store()
+
+    mem_session_id = memory_store.session_id
+
+    # Capture the incoming user message to include in the first turn's recording.
+    _init_msgs: list[Message] = (
+        [messages[-1]] if messages and messages[-1].get("role") == "user" else []
+    )
+    _first_turn = True
+
     state = LoopState(messages=tuple(messages))
     executor: StreamingExecutor | None = None
+
+    async def _record(asst_msg: Any, results: list[Message]) -> None:
+        nonlocal _first_turn
+        turn_msgs: list[Message] = []
+        if _first_turn:
+            turn_msgs.extend(_init_msgs)
+            _first_turn = False
+        if asst_msg is not None:
+            turn_msgs.append(asst_msg.to_openai_dict())
+        turn_msgs.extend(results)
+        if not turn_msgs:
+            return
+        try:
+            memory_store.record_turn(turn_msgs, session_id=mem_session_id)
+        except Exception:
+            logger.warning("memory_store.record_turn failed", exc_info=True)
 
     try:
         while True:
             # Phase 1: pre-flight context shaping
-            state = await maybe_compact(state, llm)
+            state = await maybe_compact(state, llm, memory_store=memory_store)
             yield TurnStart(turn=state.turn)
 
             # Phase 2: stream model + start tools as they arrive
             executor = StreamingExecutor(tools, can_use_tool, signal, expose_tool_errors)
             assistant_msg = None
             api_error = None
+            results: list[Message] = []
 
             try:
                 async for ev in llm.stream(
@@ -96,6 +136,9 @@ async def run(
                 api_error = e
             except Exception as e:
                 yield ModelError(error=e)
+                if on_turn_end:
+                    await on_turn_end(state)
+                await _record(assistant_msg, results)
                 yield Terminal(reason="model_error")
                 return
 
@@ -103,10 +146,14 @@ async def run(
             if api_error is not None:
                 if not state.attempted_compact_recovery:
                     state = await maybe_compact(
-                        state.advance(attempted_compact_recovery=True), llm
+                        state.advance(attempted_compact_recovery=True), llm,
+                        memory_store=memory_store,
                     )
                     state = state.advance(last_transition="context_overflow_recovery")
                     continue
+                if on_turn_end:
+                    await on_turn_end(state)
+                await _record(assistant_msg, results)
                 yield ContextOverflow(error=api_error)
                 yield Terminal(reason="context_overflow")
                 return
@@ -115,6 +162,9 @@ async def run(
             if signal and signal.is_set():
                 async for r in executor.drain_with_synthetic_errors():
                     yield r
+                if on_turn_end:
+                    await on_turn_end(state)
+                await _record(assistant_msg, results)
                 yield Terminal(reason="aborted")
                 return
 
@@ -123,6 +173,7 @@ async def run(
             if not tool_calls:
                 if on_turn_end:
                     await on_turn_end(state)
+                await _record(assistant_msg, results)
                 yield Terminal(reason="completed")
                 return
 
@@ -130,13 +181,15 @@ async def run(
 
             # Phase 5: drain remaining tool execution. The executor honors the
             # abort signal internally, racing it against in-flight tasks.
-            results: list[Message] = []
             async for r in executor.drain_remaining():
                 yield r
                 if isinstance(r, ToolResult):
                     results.append(r.to_message())
 
             if signal is not None and signal.is_set():
+                if on_turn_end:
+                    await on_turn_end(state)
+                await _record(assistant_msg, results)
                 yield Terminal(reason="aborted")
                 return
 
@@ -144,17 +197,20 @@ async def run(
             next_turn = state.turn + 1
             if next_turn >= max_turns:
                 yield MaxTurnsReached(turn=next_turn)
+                await _record(assistant_msg, results)
                 yield Terminal(reason="max_turns")
                 return
 
             # Phase 7: loop-detection guard (only when not hitting max_turns)
             if _is_repeating(state.messages, tool_calls):
                 yield ToolLoopDetected(calls=tool_calls)
+                await _record(assistant_msg, results)
                 yield Terminal(reason="tool_loop")
                 return
 
             if on_turn_end:
                 await on_turn_end(state)
+            await _record(assistant_msg, results)
 
             new_messages = (
                 *state.messages,

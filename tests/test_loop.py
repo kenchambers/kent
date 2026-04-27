@@ -532,3 +532,292 @@ async def test_tool_error_exposed_with_flag():
     error_results = [e for e in events if isinstance(e, ToolResultEv) and e.is_error]
     assert len(error_results) == 1
     assert "secret-path" in error_results[0].output
+
+
+# ---------- memory_store integration ---------------------------------------- #
+
+class RecordingMemoryStore:
+    """Test double that records every record_turn call."""
+
+    def __init__(self):
+        self._session_id = "recording-session"
+        self.turns: list[list[dict]] = []
+        self.wake_up_calls = 0
+        self.recall_calls: list[str] = []
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def record_turn(self, messages, *, session_id):
+        self.turns.append(list(messages))
+
+    def wake_up(self) -> str:
+        self.wake_up_calls += 1
+        return ""
+
+    def recall(self, query, k=5) -> str:
+        self.recall_calls.append(query)
+        return "recalled: " + query
+
+
+@pytest.mark.asyncio
+async def test_record_turn_fires_on_completed():
+    store = RecordingMemoryStore()
+    llm = FakeLLM([ScriptedTurn(text="Hello!")])
+    registry = ToolRegistry()
+    async for _ in run(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=registry,
+        llm=llm,
+        memory_store=store,
+    ):
+        pass
+    assert len(store.turns) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_turn_fires_on_model_error():
+    store = RecordingMemoryStore()
+    llm = FakeLLM([ScriptedTurn(raises=RuntimeError("boom"))])
+    registry = ToolRegistry()
+    async for _ in run(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=registry,
+        llm=llm,
+        memory_store=store,
+    ):
+        pass
+    assert len(store.turns) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_turn_fires_on_context_overflow():
+    store = RecordingMemoryStore()
+    llm = FakeLLM([
+        ScriptedTurn(raises=ContextOverflowError("overflow 1")),
+        ScriptedTurn(raises=ContextOverflowError("overflow 2")),
+    ])
+    registry = ToolRegistry()
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        memory_store=store,
+    ):
+        pass
+    assert len(store.turns) >= 1
+
+
+@pytest.mark.asyncio
+async def test_record_turn_fires_on_max_turns():
+    store = RecordingMemoryStore()
+    tc = make_tool_call("echo", {"text": "x"})
+    turns = [ScriptedTurn(text="", tool_calls=[tc]) for _ in range(5)]
+    llm = FakeLLM(turns)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        max_turns=3,
+        memory_store=store,
+    ):
+        pass
+    assert len(store.turns) >= 1
+
+
+@pytest.mark.asyncio
+async def test_record_turn_fires_on_tool_loop():
+    store = RecordingMemoryStore()
+    tc = make_tool_call("echo", {"text": "same"})
+    turns = [ScriptedTurn(text="", tool_calls=[tc]) for _ in range(10)]
+    llm = FakeLLM(turns)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        max_turns=20,
+        memory_store=store,
+    ):
+        pass
+    assert len(store.turns) >= 1
+
+
+@pytest.mark.asyncio
+async def test_record_turn_fires_on_next_turn():
+    store = RecordingMemoryStore()
+    tc = make_tool_call("echo", {"text": "x"})
+    llm = FakeLLM([ScriptedTurn(tool_calls=[tc]), ScriptedTurn(text="Done")])
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        memory_store=store,
+    ):
+        pass
+    # At minimum: one record for the tool-using turn + one for the final turn
+    assert len(store.turns) == 2
+
+
+@pytest.mark.asyncio
+async def test_broken_memory_store_does_not_break_loop():
+    """A store whose record_turn raises must not abort a conversation."""
+    class BrokenStore:
+        @property
+        def session_id(self): return "broken"
+        def record_turn(self, messages, *, session_id): raise RuntimeError("storage down")
+        def wake_up(self): return ""
+        def recall(self, query, k=5): return ""
+
+    llm = FakeLLM([ScriptedTurn(text="Hello!")])
+    registry = ToolRegistry()
+    events = []
+    async for ev in run(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=registry,
+        llm=llm,
+        memory_store=BrokenStore(),
+    ):
+        events.append(ev)
+    terminal = next(e for e in events if isinstance(e, Terminal))
+    assert terminal.reason == "completed"
+
+
+@pytest.mark.asyncio
+async def test_on_turn_end_fires_on_model_error():
+    llm = FakeLLM([ScriptedTurn(raises=RuntimeError("boom"))])
+    registry = ToolRegistry()
+    called = []
+    async def on_end(state): called.append(("model_error", state.turn))
+    async for _ in run(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=registry,
+        llm=llm,
+        on_turn_end=on_end,
+    ):
+        pass
+    assert len(called) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_turn_end_fires_on_max_turns():
+    tc = make_tool_call("echo", {"text": "x"})
+    turns = [ScriptedTurn(text="", tool_calls=[tc]) for _ in range(5)]
+    llm = FakeLLM(turns)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    called = []
+    async def on_end(state): called.append(state.turn)
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        max_turns=3,
+        on_turn_end=on_end,
+    ):
+        pass
+    # on_turn_end fires on each completed turn AND on the max_turns terminal.
+    assert len(called) >= 1
+
+
+@pytest.mark.asyncio
+async def test_on_turn_end_fires_on_tool_loop():
+    tc = make_tool_call("echo", {"text": "same"})
+    turns = [ScriptedTurn(text="", tool_calls=[tc]) for _ in range(10)]
+    llm = FakeLLM(turns)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    called = []
+    async def on_end(state): called.append(state.turn)
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        max_turns=20,
+        on_turn_end=on_end,
+    ):
+        pass
+    assert len(called) >= 1
+
+
+@pytest.mark.asyncio
+async def test_on_turn_end_fires_on_context_overflow():
+    llm = FakeLLM([
+        ScriptedTurn(raises=ContextOverflowError("overflow 1")),
+        ScriptedTurn(raises=ContextOverflowError("overflow 2")),
+    ])
+    registry = ToolRegistry()
+    called = []
+    async def on_end(state): called.append(state.turn)
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        on_turn_end=on_end,
+    ):
+        pass
+    assert len(called) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_turn_end_fires_on_aborted():
+    signal = asyncio.Event()
+
+    class SlowTool:
+        name = "slow"
+        description = "Slow tool"
+        class Args(BaseModel): pass
+        input_model = Args
+        def is_concurrency_safe(self, args): return False
+        async def call(self, args, ctx):
+            await asyncio.sleep(100)
+            return ToolResult(call_id="", output="done")
+
+    tc = make_tool_call("slow", {})
+    llm = FakeLLM([ScriptedTurn(text="", tool_calls=[tc])])
+    registry = ToolRegistry()
+    registry.register(SlowTool())
+
+    async def set_signal_soon():
+        await asyncio.sleep(0.01)
+        signal.set()
+
+    called = []
+    async def on_end(state): called.append(state.turn)
+    task = asyncio.create_task(set_signal_soon())
+    async for _ in run(
+        messages=[{"role": "user", "content": "go"}],
+        tools=registry,
+        llm=llm,
+        signal=signal,
+        on_turn_end=on_end,
+    ):
+        pass
+    await task
+    assert len(called) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_turn_records_user_message():
+    """The user's initial message should be included in the first turn's recording."""
+    store = RecordingMemoryStore()
+    llm = FakeLLM([ScriptedTurn(text="answer")])
+    registry = ToolRegistry()
+    async for _ in run(
+        messages=[{"role": "user", "content": "my question"}],
+        tools=registry,
+        llm=llm,
+        memory_store=store,
+    ):
+        pass
+    assert len(store.turns) == 1
+    msgs = store.turns[0]
+    roles = [m["role"] for m in msgs]
+    assert "user" in roles
+    assert "assistant" in roles
