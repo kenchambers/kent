@@ -186,11 +186,11 @@ def test_detect_shell_backend_matches_host():
 @pytest.mark.asyncio
 async def test_shell_runs_simple_command():
     sh = Shell()
-    result = await sh.call(ShellArgs(command='echo slim-agent-ok'), ToolContext())
+    result = await sh.call(ShellArgs(command='echo agent-ok'), ToolContext())
     assert not result.is_error
     assert isinstance(result.output, dict)
     assert result.output["exit_code"] == 0
-    assert "slim-agent-ok" in result.output["stdout"]
+    assert "agent-ok" in result.output["stdout"]
 
 
 @pytest.mark.skipif(platform.system() == "Windows", reason="POSIX shell required")

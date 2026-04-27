@@ -1,4 +1,4 @@
-# Slim Agent — MVP-Ready Hardening
+# Agent — MVP-Ready Hardening
 
 ## Context
 
