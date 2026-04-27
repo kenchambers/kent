@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# kent credentials (live outside the repo at ~/.kent/ by default,
+# but gitignore in case KENT_HOME points inside the working tree)
+credentials.json
