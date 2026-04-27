@@ -88,3 +88,59 @@ async def test_compact_signature_drops_system_param():
     state = LoopState(messages=({"role": "user", "content": "hi"},))
     result = await maybe_compact(state, llm)
     assert result is state
+
+
+@pytest.mark.asyncio
+async def test_compact_embeds_recalled_memory_when_store_provided():
+    """Summary message contains both <conversation-summary> and <recalled-memory>."""
+    class StubMemoryStore:
+        @property
+        def session_id(self): return "stub"
+        def record_turn(self, messages, *, session_id): pass
+        def wake_up(self): return "octarine is my favorite colour"
+        def recall(self, query, k=5): return ""
+
+    llm = FakeLLMForCompact(context_window=10, summary="the summary")
+    messages = tuple({"role": "user", "content": f"msg {i}"} for i in range(20))
+    state = LoopState(messages=messages)
+
+    result = await maybe_compact(state, llm, memory_store=StubMemoryStore())
+
+    content = result.messages[0]["content"]
+    assert "<conversation-summary>" in content
+    assert "<recalled-memory>" in content
+    assert "octarine" in content
+
+
+@pytest.mark.asyncio
+async def test_compact_no_recalled_memory_block_when_store_absent():
+    """Summary message has only <conversation-summary> when no store provided."""
+    llm = FakeLLMForCompact(context_window=10, summary="the summary")
+    messages = tuple({"role": "user", "content": f"msg {i}"} for i in range(20))
+    state = LoopState(messages=messages)
+
+    result = await maybe_compact(state, llm)
+
+    content = result.messages[0]["content"]
+    assert "<conversation-summary>" in content
+    assert "<recalled-memory>" not in content
+
+
+@pytest.mark.asyncio
+async def test_compact_no_recalled_memory_block_when_wake_up_empty():
+    """When wake_up() returns empty string, <recalled-memory> is not included."""
+    class SilentStore:
+        @property
+        def session_id(self): return "silent"
+        def record_turn(self, messages, *, session_id): pass
+        def wake_up(self): return ""
+        def recall(self, query, k=5): return ""
+
+    llm = FakeLLMForCompact(context_window=10, summary="summary")
+    messages = tuple({"role": "user", "content": f"msg {i}"} for i in range(20))
+    state = LoopState(messages=messages)
+
+    result = await maybe_compact(state, llm, memory_store=SilentStore())
+
+    content = result.messages[0]["content"]
+    assert "<recalled-memory>" not in content

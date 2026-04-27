@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .llm import LLM
     from .state import LoopState, Message
+    from .memory.store import MemoryStore
 
 COMPACT_THRESHOLD = 0.85
 COMPACT_KEEP_TAIL = 6
@@ -24,7 +25,12 @@ async def _summarize(messages: list["Message"], llm: "LLM") -> str:
     return "".join(text_parts)
 
 
-async def maybe_compact(state: "LoopState", llm: "LLM") -> "LoopState":
+async def maybe_compact(
+    state: "LoopState",
+    llm: "LLM",
+    *,
+    memory_store: "MemoryStore | None" = None,
+) -> "LoopState":
     """Summarize the head of state.messages when the context exceeds COMPACT_THRESHOLD."""
     used = llm.count_tokens(list(state.messages)) / llm.context_window
     if used < COMPACT_THRESHOLD:
@@ -38,9 +44,15 @@ async def maybe_compact(state: "LoopState", llm: "LLM") -> "LoopState":
     tail = list(state.messages[-COMPACT_KEEP_TAIL:])
 
     summary = await _summarize(head, llm)
+    parts = [f"<conversation-summary>{summary}</conversation-summary>"]
+    if memory_store:
+        recalled = memory_store.wake_up()
+        if recalled:
+            parts.append(f"<recalled-memory>{recalled}</recalled-memory>")
+
     summary_msg: "Message" = {
         "role": "system",
-        "content": f"<conversation-summary>{summary}</conversation-summary>",
+        "content": "\n".join(parts),
     }
     new_messages = (summary_msg, *tail)
     return state.advance(messages=new_messages)
