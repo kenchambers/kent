@@ -19,6 +19,8 @@ from .builtin.spawn import Spawn
 from .builtin.web_search import WebSearch
 from .builtin.web_fetch import WebFetch
 from .builtin.shell import Shell, ShellBackend, detect_shell_backend
+from .memory import MemoryStore, MemPalaceStore
+from .builtin.memory_recall import MemoryRecall
 
 __all__ = [
     "run",
@@ -34,4 +36,5 @@ __all__ = [
     "MaxTurnsReached", "ToolLoopDetected", "Terminal",
     "Spawn", "WebSearch", "WebFetch",
     "Shell", "ShellBackend", "detect_shell_backend",
+    "MemoryStore", "MemPalaceStore", "MemoryRecall",
 ]

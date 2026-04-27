@@ -12,6 +12,7 @@ Layout follows the pattern of opencode / hermes-agent / claude-code:
 
 Inside the REPL, slash commands:
   /help    /tools    /model    /clear    /exit
+  /memory  /recall <query>    /forget
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import platform
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from .builtin.shell import Shell, detect_shell_backend
 from .builtin.spawn import Spawn
@@ -41,6 +42,9 @@ from .events import (
 from .llm import LLM, OpenAICompatibleLLM
 from .loop import run
 from .tools import ToolRegistry
+
+if TYPE_CHECKING:
+    from .memory.store import MemoryStore
 
 APP_NAME = "kent"
 CONFIG_DIR = Path(os.environ.get("KENT_HOME", str(Path.home() / ".kent")))
@@ -62,9 +66,11 @@ SYSTEM_PROMPT = (
     "You are kent, a terminal AI agent. You have these tools: "
     "web_search (DuckDuckGo HTML, no API key), web_fetch (URL → markdown), "
     "shell (host shell — bash on macOS/Linux/WSL, PowerShell on Windows), "
-    "spawn_subagent (delegate a focused subtask). Prefer web_search before "
-    "web_fetch. Prefer shell over re-implementing with another tool. Keep "
-    "responses concise."
+    "spawn_subagent (delegate a focused subtask), "
+    "memory_recall (search long-term memory from previous sessions). "
+    "Prefer web_search before web_fetch. Prefer shell over re-implementing with another tool. "
+    "Use memory_recall when the user asks about things you might have discussed before. "
+    "Keep responses concise."
 )
 
 
@@ -286,6 +292,7 @@ async def _run_once(
     user_input: str,
     *,
     quiet_tools: bool = False,
+    memory_store: "MemoryStore | None" = None,
 ) -> tuple[list[dict], str]:
     """Single agent turn. Returns (new_history, terminal_reason)."""
     history = [*history, {"role": "user", "content": user_input}]
@@ -297,6 +304,7 @@ async def _run_once(
         llm=llm,
         system=SYSTEM_PROMPT,
         max_turns=15,
+        memory_store=memory_store,
     ):
         if isinstance(ev, TextDelta):
             print(ev.text, end="", flush=True)
@@ -328,13 +336,15 @@ async def _stream_one_turn(
     *,
     critic_llm: LLM | None = None,
     quiet_tools: bool = False,
+    memory_store: "MemoryStore | None" = None,
 ) -> tuple[list[dict], str]:
     """
     Run one turn; if a critic is provided and the turn completed cleanly,
     run a single critique pass and revise once if issues are flagged.
     """
     history, reason = await _run_once(
-        registry, llm, history, user_input, quiet_tools=quiet_tools
+        registry, llm, history, user_input,
+        quiet_tools=quiet_tools, memory_store=memory_store,
     )
     if critic_llm is None or reason != "completed":
         return history, reason
@@ -351,7 +361,8 @@ async def _stream_one_turn(
         f"Please address them concisely:\n\n{verdict}"
     )
     return await _run_once(
-        registry, llm, history, injected, quiet_tools=quiet_tools
+        registry, llm, history, injected,
+        quiet_tools=quiet_tools, memory_store=memory_store,
     )
 
 
@@ -363,6 +374,9 @@ slash commands:
   /tools           list registered tools
   /model           show current service / model
   /clear           clear conversation history
+  /memory          show memory store info
+  /recall <query>  search long-term memory
+  /forget          delete current session transcript (with confirmation)
   /exit, /quit     leave the session
 """
 
@@ -373,9 +387,12 @@ def _handle_slash(
     history: list[dict],
     registry: ToolRegistry,
     choice: StartupChoice,
+    memory_store: "MemoryStore | None" = None,
 ) -> tuple[list[dict], bool]:
     """Returns (new_history, should_exit)."""
-    head = cmd.strip().lower()
+    cmd_stripped = cmd.strip()
+    head = cmd_stripped.lower()
+
     if head in ("/exit", "/quit"):
         print("bye.")
         return history, True
@@ -391,6 +408,61 @@ def _handle_slash(
     elif head == "/clear":
         print("[conversation cleared]")
         return [], False
+    elif head == "/memory":
+        if memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                if isinstance(memory_store, MemPalaceStore):
+                    palace = memory_store._palace_path
+                    transcript = memory_store._transcript_path
+                    print(f"  palace     : {palace}  (exists: {palace.exists()})")
+                    print(f"  transcript : {transcript}  (exists: {transcript.exists()})")
+                    print(f"  session id : {memory_store.session_id}")
+                else:
+                    print(f"  session id : {memory_store.session_id}")
+            except Exception as e:
+                print(f"  error: {e}")
+    elif head.startswith("/recall"):
+        query = cmd_stripped[len("/recall"):].strip()
+        if not query:
+            print("usage: /recall <query>")
+        elif memory_store is None:
+            print("no memory store configured")
+        else:
+            result = memory_store.recall(query)
+            print(result or "(no memories found)")
+    elif head == "/forget":
+        if memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                if isinstance(memory_store, MemPalaceStore):
+                    transcript = memory_store._transcript_path
+                    try:
+                        confirm = input(
+                            "Delete current session transcript? (y/N): "
+                        ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        confirm = ""
+                    if confirm == "y":
+                        if transcript.exists():
+                            transcript.unlink()
+                            print("[session transcript deleted]")
+                            print(
+                                "Note: long-term palace entries persist. "
+                                "Use mempalace tools to clear them."
+                            )
+                        else:
+                            print("[no transcript file to delete]")
+                    else:
+                        print("[cancelled]")
+                else:
+                    print("forget not supported for this store type")
+            except Exception as e:
+                print(f"  error: {e}")
     else:
         print(f"unknown slash command: {cmd!r}. /help for the list.")
     return history, False
@@ -399,10 +471,22 @@ def _handle_slash(
 # ---------- subcommands ---------------------------------------------------- #
 
 async def _repl(choice: StartupChoice) -> None:
+    from .memory import MemPalaceStore
+    from .builtin.memory_recall import MemoryRecall
+
     llm = _make_llm(choice)
     critic_llm = _make_critic_llm(choice)
+    memory_store = MemPalaceStore()
+
     registry = build_registry()
-    registry.register(Spawn(parent_registry=registry, llm=llm))
+    registry.register(Spawn(parent_registry=registry, llm=llm, memory_store=memory_store))
+    registry.register(MemoryRecall(memory_store))
+
+    # Inject wake-up recall at session start
+    history: list[dict] = []
+    recalled = memory_store.wake_up()
+    if recalled:
+        history = [{"role": "system", "content": f"<recalled-memory>{recalled}</recalled-memory>"}]
 
     print()
     print("[ready]")
@@ -410,10 +494,10 @@ async def _repl(choice: StartupChoice) -> None:
     print(f"  Model  : {choice.model}")
     print(f"  Critic : {choice.critic_model or '<disabled>'}")
     print(f"  Tools  : {', '.join(registry.names())}")
+    print(f"  Memory : {memory_store._palace_path}")
     print("  Type your message. /help for slash commands. /exit to quit.")
     print("-" * 60)
 
-    history: list[dict] = []
     while True:
         try:
             user_input = input("\nyou> ").strip()
@@ -424,14 +508,19 @@ async def _repl(choice: StartupChoice) -> None:
             continue
         if user_input.startswith("/"):
             history, should_exit = _handle_slash(
-                user_input, history=history, registry=registry, choice=choice
+                user_input,
+                history=history,
+                registry=registry,
+                choice=choice,
+                memory_store=memory_store,
             )
             if should_exit:
                 return
             continue
         try:
             history, _ = await _stream_one_turn(
-                registry, llm, history, user_input, critic_llm=critic_llm
+                registry, llm, history, user_input,
+                critic_llm=critic_llm, memory_store=memory_store,
             )
         except KeyboardInterrupt:
             print("\n[interrupted]")
@@ -479,13 +568,25 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     llm = _make_llm(choice)
     critic_llm = _make_critic_llm(choice)
+
+    from .memory import MemPalaceStore
+    from .builtin.memory_recall import MemoryRecall
+    memory_store = MemPalaceStore()
+
     registry = build_registry()
-    registry.register(Spawn(parent_registry=registry, llm=llm))
+    registry.register(Spawn(parent_registry=registry, llm=llm, memory_store=memory_store))
+    registry.register(MemoryRecall(memory_store))
+
+    history: list[dict] = []
+    recalled = memory_store.wake_up()
+    if recalled:
+        history = [{"role": "system", "content": f"<recalled-memory>{recalled}</recalled-memory>"}]
 
     async def _go() -> str:
         _, reason = await _stream_one_turn(
-            registry, llm, [], args.prompt,
+            registry, llm, history, args.prompt,
             critic_llm=critic_llm, quiet_tools=args.quiet,
+            memory_store=memory_store,
         )
         return reason
 
@@ -564,8 +665,44 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         print(f"  {sid:<12} env({env_key})={env_present}  saved-credential={cred_present}")
 
     print()
+    print("[memory]")
+    try:
+        from datetime import datetime
+        from .memory.mempalace_store import _TRANSCRIPT_BASE, _DEFAULT_PALACE
+        from mempalace.layers import MemoryStack
+        palace = _DEFAULT_PALACE
+        print(f"  palace     : {palace}  (exists: {palace.exists()})")
+        print(f"  transcripts: {_TRANSCRIPT_BASE}  (exists: {_TRANSCRIPT_BASE.exists()})")
+
+        if palace.exists():
+            try:
+                status = MemoryStack(str(palace)).status()
+                print(f"  drawers    : {status.get('total_drawers', '?')}")
+            except Exception as e:
+                print(f"  drawers    : <error: {e}>")
+            try:
+                mtimes = [p.stat().st_mtime for p in palace.rglob("*") if p.is_file()]
+                if mtimes:
+                    last = datetime.fromtimestamp(max(mtimes)).isoformat(timespec="seconds")
+                    print(f"  last-write : {last}")
+                else:
+                    print("  last-write : <empty palace>")
+            except Exception as e:
+                print(f"  last-write : <error: {e}>")
+        else:
+            print("  drawers    : 0  (palace not yet created)")
+            print("  last-write : <never>")
+    except ImportError:
+        print("  mempalace  : NOT INSTALLED  (pip install 'mempalace>=3.3')")
+    except Exception as e:
+        print(f"  error      : {e}")
+
+    print()
     print("[deps]")
-    for mod in ("openai", "httpx", "selectolax", "markdownify", "tiktoken", "pydantic"):
+    for mod in (
+        "openai", "httpx", "selectolax", "markdownify",
+        "tiktoken", "pydantic", "mempalace",
+    ):
         try:
             __import__(mod)
             print(f"  {mod:<14} OK")
