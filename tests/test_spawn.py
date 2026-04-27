@@ -1,12 +1,12 @@
 import asyncio
 import pytest
 from pydantic import BaseModel
-from slim_agent import run, ToolRegistry, ToolResult, Terminal, ToolContext
-from slim_agent.events import (
+from agent import run, ToolRegistry, ToolResult, Terminal, ToolContext
+from agent.events import (
     TextDelta, ToolCallComplete, AssistantMessageComplete, AssistantMessage, ToolCall,
     ToolResult as ToolResultEv,
 )
-from slim_agent.builtin.spawn import Spawn
+from agent.builtin.spawn import Spawn
 
 
 class ScriptedLLM:

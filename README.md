@@ -2,7 +2,7 @@
 
 A minimal, typed async agent runtime for OpenAI-compatible LLMs, plus a `kent` CLI for using it interactively from the terminal — in the spirit of [opencode](https://opencode.ai/) and [hermes-agent](https://hermes-agent.nousresearch.com/), but small enough to read in one sitting.
 
-The Python package is imported as `slim_agent`; the installed CLI binary is `kent`.
+The Python package is imported as `agent`; the installed CLI binary is `kent`.
 
 ## Table of contents
 
@@ -36,7 +36,7 @@ The Python package is imported as `slim_agent`; the installed CLI binary is `ken
 
 Two layers in one repo:
 
-1. **A library** (`slim_agent`) — a ~400-line agent loop that streams events, starts safe tool calls *while the model is still streaming*, partitions concurrent vs. serial tools, and recovers from context-window overflow by compacting and retrying. Works against anything OpenAI-shaped: OpenAI, Atlas Cloud, Together, Groq, OpenRouter, vLLM, Ollama, llama.cpp.
+1. **A library** (`agent`) — a ~400-line agent loop that streams events, starts safe tool calls *while the model is still streaming*, partitions concurrent vs. serial tools, and recovers from context-window overflow by compacting and retrying. Works against anything OpenAI-shaped: OpenAI, Atlas Cloud, Together, Groq, OpenRouter, vLLM, Ollama, llama.cpp.
 2. **A CLI** (`kent`) — a small terminal front-end that auto-detects your shell, prompts for a service / model / key on first run, persists the choice, and drops you into a REPL with web-search, web-fetch, shell, and subagent tools wired up. Ships subcommands (`run`, `auth`, `models`, `doctor`) so it's scriptable too.
 
 Web search uses **DuckDuckGo HTML scraping** — no third-party search API key required.
@@ -44,7 +44,7 @@ Web search uses **DuckDuckGo HTML scraping** — no third-party search API key r
 ## Repo layout
 
 ```
-slim_agent/
+agent/
 ├── __init__.py        # public exports
 ├── cli.py             # `kent` CLI: subcommands, REPL, slash commands, persistence
 ├── loop.py            # the agent loop (streams events, drives tools, handles overflow)
@@ -67,7 +67,7 @@ tests/                 # pytest suite (offline + opt-in integration tests)
 From PyPI (when published):
 
 ```bash
-uv add slim-agent
+uv add agent
 ```
 
 From a clone:
@@ -226,7 +226,7 @@ Concurrency-safe tools batch and run in parallel via `StreamingExecutor`; unsafe
 |-------------|----------------------------|-----------------------------------|------------------------|
 | atlascloud  | `qwen/qwen3.6-35b-a3b`     | `https://api.atlascloud.ai/v1`    | `ATLASCLOUD_API_KEY`   |
 
-Adding a new service: edit `SUPPORTED_SERVICES` in `slim_agent/cli.py` — it's a dict literal. For library use, just instantiate `OpenAICompatibleLLM(base_url=..., api_key=..., model=..., context_window=...)` directly.
+Adding a new service: edit `SUPPORTED_SERVICES` in `agent/cli.py` — it's a dict literal. For library use, just instantiate `OpenAICompatibleLLM(base_url=..., api_key=..., model=..., context_window=...)` directly.
 
 ## Configuration
 
@@ -251,7 +251,7 @@ Override with environment:
 ```python
 import asyncio
 from pydantic import BaseModel
-from slim_agent import run, ToolRegistry, ToolResult, OpenAICompatibleLLM, TextDelta, Terminal
+from agent import run, ToolRegistry, ToolResult, OpenAICompatibleLLM, TextDelta, Terminal
 
 class EchoTool:
     name = "echo"
@@ -280,7 +280,7 @@ asyncio.run(main())
 
 ```python
 from pydantic import BaseModel
-from slim_agent import ToolResult, ToolContext
+from agent import ToolResult, ToolContext
 
 class MyTool:
     name = "my_tool"               # unique tool name
@@ -297,8 +297,8 @@ class MyTool:
 ### Subagent example
 
 ```python
-from slim_agent import ToolRegistry, OpenAICompatibleLLM
-from slim_agent.builtin.spawn import Spawn
+from agent import ToolRegistry, OpenAICompatibleLLM
+from agent.builtin.spawn import Spawn
 
 registry = ToolRegistry()
 llm = OpenAICompatibleLLM(...)

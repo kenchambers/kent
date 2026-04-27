@@ -2,11 +2,11 @@
 
 ## Context
 
-Today, kent (`slim_agent` runtime + `kent` CLI) loses everything when:
-1. `slim_agent.compact.maybe_compact` summarizes the head of the conversation
-   (`slim_agent/compact.py:27-46`) — verbatim detail in the head is replaced by
+Today, kent (`agent` runtime + `kent` CLI) loses everything when:
+1. `agent.compact.maybe_compact` summarizes the head of the conversation
+   (`agent/compact.py:27-46`) — verbatim detail in the head is replaced by
    a single LLM-written summary system message and is gone.
-2. The process exits — `_repl()` (`slim_agent/cli.py:401-438`) holds history in
+2. The process exits — `_repl()` (`agent/cli.py:401-438`) holds history in
    a local list; `kent run` is one-shot. Nothing is persisted.
 
 The user wants long-term, cross-session memory that survives both events. Library
@@ -18,12 +18,12 @@ content is never lost.
 User decisions (locked from Q&A):
 
 - **Always-on, no opt-out.** `mempalace` becomes a hard dependency of
-  `slim-agent`. The agent loop always writes to a memory store; the only way
+  `agent`. The agent loop always writes to a memory store; the only way
   to bypass is to pass `memory_store=NullMemoryStore()` (a test seam, not a
   user-facing toggle).
-- **Library-default-on.** `slim_agent.run()` constructs a default
+- **Library-default-on.** `agent.run()` constructs a default
   `MemPalaceStore` when no `memory_store` kwarg is supplied. Library users
-  importing `slim_agent` get persistence automatically; CLI users get it too.
+  importing `agent` get persistence automatically; CLI users get it too.
 - **Single global wing** (`wing="kent"`). Every kent session sees every other
   session's wake-up recall. Per-project scoping is deferred.
 - **Strategy pattern.** A `MemoryStore` Protocol decouples the loop from
@@ -33,7 +33,7 @@ User decisions (locked from Q&A):
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ slim_agent.run(messages, tools, llm, memory_store=…)               │
+│ agent.run(messages, tools, llm, memory_store=…)               │
 │                                                                    │
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │ maybe_compact(state, llm, memory_store)                      │  │
@@ -54,7 +54,7 @@ User decisions (locked from Q&A):
                                     │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│ slim_agent.memory.MemPalaceStore                                   │
+│ agent.memory.MemPalaceStore                                   │
 │                                                                    │
 │  Persists by *appending Claude-Code-format JSONL* to               │
 │  ${KENT_HOME}/transcripts/<session_id>.jsonl, then calls           │
@@ -78,7 +78,7 @@ implementing the same Protocol; the loop, CLI, and tools don't change.
 ## The `MemoryStore` Protocol
 
 ```python
-# slim_agent/memory/store.py
+# agent/memory/store.py
 class MemoryStore(Protocol):
     """Strategy interface. Swap implementations without touching the loop."""
 
@@ -163,11 +163,11 @@ hnswlib quirks).
 
 | Loop event                                                                     | Hook                              | Why                                                             |
 |--------------------------------------------------------------------------------|-----------------------------------|------------------------------------------------------------------|
-| `slim_agent/loop.py:74` — top of every turn, just before `maybe_compact`       | (no change)                       | —                                                                |
-| `slim_agent/compact.py:40` — after `_summarize`, before replacing `head`       | `memory_store.on_compaction(head)`| Capture verbatim head before it's collapsed into a summary       |
-| `slim_agent/compact.py` — after compaction returns                              | re-inject `wake_up()` as system msg | Wake-up text would otherwise be in the compacted head and lost   |
-| `slim_agent/loop.py:124` — terminal "completed" path                           | `memory_store.on_turn_end(turn)`  | Existing `on_turn_end` callback already runs here; we layer in   |
-| `slim_agent/loop.py:156` — between turns when more turns will follow           | `memory_store.on_turn_end(turn)`  | Same callback; ensures incremental save mid-conversation         |
+| `agent/loop.py:74` — top of every turn, just before `maybe_compact`       | (no change)                       | —                                                                |
+| `agent/compact.py:40` — after `_summarize`, before replacing `head`       | `memory_store.on_compaction(head)`| Capture verbatim head before it's collapsed into a summary       |
+| `agent/compact.py` — after compaction returns                              | re-inject `wake_up()` as system msg | Wake-up text would otherwise be in the compacted head and lost   |
+| `agent/loop.py:124` — terminal "completed" path                           | `memory_store.on_turn_end(turn)`  | Existing `on_turn_end` callback already runs here; we layer in   |
+| `agent/loop.py:156` — between turns when more turns will follow           | `memory_store.on_turn_end(turn)`  | Same callback; ensures incremental save mid-conversation         |
 | **NEW**: terminal paths `model_error`, `max_turns`, `tool_loop`, `aborted`     | `memory_store.on_turn_end(turn)`  | Today these skip `on_turn_end` (data loss risk on crash). Fix.   |
 | Tool call: `memory_recall(query, k)`                                           | `memory_store.search(query, k)`   | Model-driven recall                                              |
 | REPL start / `kent run` start                                                  | `memory_store.wake_up()` injected | Recall context for new sessions                                  |
@@ -184,11 +184,11 @@ Per "we don't want to lose anything," we move the `on_turn_end` call into a
 
 | Path                                       | Purpose                                                           |
 |--------------------------------------------|-------------------------------------------------------------------|
-| `slim_agent/memory/__init__.py`            | Re-export `MemoryStore`, `MemPalaceStore`, `NullMemoryStore`      |
-| `slim_agent/memory/store.py`               | `MemoryStore` Protocol + `NullMemoryStore`                        |
-| `slim_agent/memory/mempalace_store.py`     | `MemPalaceStore` (lazy-imports mempalace at __init__)             |
-| `slim_agent/memory/transcript.py`          | JSONL writer producing Claude-Code-compatible records             |
-| `slim_agent/builtin/memory_recall.py`      | `MemoryRecall` tool wrapping `MemoryStore.search`                 |
+| `agent/memory/__init__.py`            | Re-export `MemoryStore`, `MemPalaceStore`, `NullMemoryStore`      |
+| `agent/memory/store.py`               | `MemoryStore` Protocol + `NullMemoryStore`                        |
+| `agent/memory/mempalace_store.py`     | `MemPalaceStore` (lazy-imports mempalace at __init__)             |
+| `agent/memory/transcript.py`          | JSONL writer producing Claude-Code-compatible records             |
+| `agent/builtin/memory_recall.py`      | `MemoryRecall` tool wrapping `MemoryStore.search`                 |
 | `tests/test_memory_store.py`               | Protocol conformance, JSONL format, sweep call, hook ordering     |
 | `tests/test_memory_transcript.py`          | Round-trip: write JSONL → `parse_claude_jsonl` reads it back      |
 | `tests/integration/test_mempalace.py`      | Real mempalace round-trip; gated by `pytest.importorskip`         |
@@ -197,12 +197,12 @@ Per "we don't want to lose anything," we move the `on_turn_end` call into a
 
 | Path                          | Change                                                                                                     |
 |-------------------------------|------------------------------------------------------------------------------------------------------------|
-| `slim_agent/loop.py`          | Add `memory_store: MemoryStore \| None = None` kwarg; default-construct `MemPalaceStore()` when None; thread to `maybe_compact`; ensure `on_turn_end` fires on every terminal path; pass `session_id` (auto-generated if not in store). |
-| `slim_agent/compact.py`       | Add optional `memory_store` kwarg; call `memory_store.on_compaction(head)` before replacement; append wake-up recap as system message after compaction. Keep 2-arg signature (existing test `test_compact_signature_drops_system_param` still passes). |
-| `slim_agent/cli.py`           | `_run_once` / `_stream_one_turn` create a `MemPalaceStore` once per REPL session, pass to `run()`; `_repl()` injects wake-up at start; register `MemoryRecall` tool; new slash commands `/memory`, `/recall <q>`, `/forget` (session-scoped delete with confirmation). |
-| `slim_agent/__init__.py`      | Export `MemoryStore`, `MemPalaceStore`, `NullMemoryStore`, `MemoryRecall`.                                |
+| `agent/loop.py`          | Add `memory_store: MemoryStore \| None = None` kwarg; default-construct `MemPalaceStore()` when None; thread to `maybe_compact`; ensure `on_turn_end` fires on every terminal path; pass `session_id` (auto-generated if not in store). |
+| `agent/compact.py`       | Add optional `memory_store` kwarg; call `memory_store.on_compaction(head)` before replacement; append wake-up recap as system message after compaction. Keep 2-arg signature (existing test `test_compact_signature_drops_system_param` still passes). |
+| `agent/cli.py`           | `_run_once` / `_stream_one_turn` create a `MemPalaceStore` once per REPL session, pass to `run()`; `_repl()` injects wake-up at start; register `MemoryRecall` tool; new slash commands `/memory`, `/recall <q>`, `/forget` (session-scoped delete with confirmation). |
+| `agent/__init__.py`      | Export `MemoryStore`, `MemPalaceStore`, `NullMemoryStore`, `MemoryRecall`.                                |
 | `pyproject.toml`              | Add `mempalace>=3.3` to `[project].dependencies` (NOT optional — user requirement).                      |
-| `slim_agent/cli.py::cmd_doctor` | Add `[memory]` block: palace_path, drawer count, last-write timestamp, wing="kent" stats.                |
+| `agent/cli.py::cmd_doctor` | Add `[memory]` block: palace_path, drawer count, last-write timestamp, wing="kent" stats.                |
 | `README.md`                   | New `## Persistent memory` section.                                                                        |
 
 ### Functions/utilities to reuse (no re-implementation)
@@ -220,20 +220,20 @@ From the **mempalace** package (verified by reading source on `main`):
 - `mempalace.layers.Layer3(palace_path).search(query, wing, room, n_results)`
   — returns formatted text.
 
-From the **slim_agent** package:
+From the **agent** package:
 
-- `LoopState.advance(**changes)` (`slim_agent/state.py:26`) — for adding the
+- `LoopState.advance(**changes)` (`agent/state.py:26`) — for adding the
   re-injected wake-up message after compaction without mutating state.
 - `on_turn_end` callback already present in `run()`
-  (`slim_agent/loop.py:56`) — repurpose it to invoke `memory_store.on_turn_end`
+  (`agent/loop.py:56`) — repurpose it to invoke `memory_store.on_turn_end`
   in addition to any user callback (chain them).
-- `ToolRegistry.register` (`slim_agent/tools.py:41`) — register `MemoryRecall`.
-- `Tool` Protocol with `is_concurrency_safe` (`slim_agent/tools.py:17`) — recall
+- `ToolRegistry.register` (`agent/tools.py:41`) — register `MemoryRecall`.
+- `Tool` Protocol with `is_concurrency_safe` (`agent/tools.py:17`) — recall
   is read-only, returns True so it batches with `web_search`/`web_fetch`.
 
 ## Critical implementation details
 
-1. **Avoiding circular imports.** `slim_agent/loop.py` must not import
+1. **Avoiding circular imports.** `agent/loop.py` must not import
    `MemPalaceStore` at top level (mempalace at import time pulls chromadb,
    which is heavy). Use TYPE_CHECKING guards and a `_default_store()` factory
    that constructs lazily inside `run()` if `memory_store is None`.
@@ -261,7 +261,7 @@ From the **slim_agent** package:
    one `sweep()` call per turn produces 1–3 batched upserts. Cost per turn
    is ~milliseconds locally.
 8. **`session_id` lifecycle.** Generated in `MemPalaceStore.__init__` once.
-   `slim_agent.run()` doesn't see it; the store owns it. The transcript file
+   `agent.run()` doesn't see it; the store owns it. The transcript file
    is named after it, and every JSONL record carries it as `sessionId`.
 
 ## Phased rollout
@@ -272,7 +272,7 @@ From the **slim_agent** package:
    `NullMemoryStore` for now (so existing tests stay green). New tests
    exercise the wiring with a `RecordingMemoryStore` double.
 2. **Phase 2 — `MemPalaceStore` + lib default.** Implement `MemPalaceStore`.
-   Flip `slim_agent.run()`'s default factory from `NullMemoryStore` to
+   Flip `agent.run()`'s default factory from `NullMemoryStore` to
    `MemPalaceStore()`. Add `mempalace>=3.3` to `pyproject.toml`. Update
    tests that don't want a real palace to inject `NullMemoryStore`
    explicitly.

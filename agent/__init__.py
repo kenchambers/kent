@@ -1,5 +1,5 @@
 """
-slim_agent — minimal async agent runtime for OpenAI-compatible LLMs.
+agent — minimal async agent runtime for OpenAI-compatible LLMs.
 Entry point: run(). Build tools via the Tool protocol and ToolRegistry.
 """
 from .loop import run

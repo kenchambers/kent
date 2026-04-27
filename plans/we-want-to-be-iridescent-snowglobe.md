@@ -2,7 +2,7 @@
 
 ## Context
 
-`slim_agent` is the green-field Python agent runtime built from the `given-our-understanding-now-validated-origami.md` plan. Implementation is complete; 21 tests pass on Python 3.13 in the UV venv. During audit, three categories of gaps surfaced:
+`agent` is the green-field Python agent runtime built from the `given-our-understanding-now-validated-origami.md` plan. Implementation is complete; 21 tests pass on Python 3.13 in the UV venv. During audit, three categories of gaps surfaced:
 
 1. **Reliability gaps** — early-exit task leaks, brittle string-match error classification, raw `str(e)` leaking in tool error paths.
 2. **Documentation gaps** — README is a 2-line stub; no consumer-visible docstrings; no `py.typed` marker so consumers can't see the typed surface.
@@ -18,7 +18,7 @@ This plan closes those gaps without overengineering.
 
 ### 1. Reliability fixes
 
-#### 1a. Generator cleanup on early exit (`slim_agent/loop.py`)
+#### 1a. Generator cleanup on early exit (`agent/loop.py`)
 **Problem**: if the consumer breaks out of `async for ev in run(...)` early (or the loop is cancelled mid-stream), in-flight tool tasks inside `StreamingExecutor` leak. They keep running until they complete, then their `Task` is GC'd with an unawaited result warning.
 
 **Fix**: wrap the body of `run()` in `try / finally`. In `finally`, call `executor.drain_with_synthetic_errors()` and discard results — this cancels every started task and clears the entry list.
@@ -38,7 +38,7 @@ async def run(...):
 
 Note: `executor` is created fresh per iteration today. Move it to a function-scoped variable so the `finally` clause has a handle to whatever's current.
 
-#### 1b. SDK-typed context-overflow detection (`slim_agent/llm.py`)
+#### 1b. SDK-typed context-overflow detection (`agent/llm.py`)
 **Problem**: `OpenAICompatibleLLM.stream` classifies overflow with `if "context" in err_str or "length" in err_str or "token" in err_str`. Auth errors, rate-limit errors, anything containing "token" can be mis-classified as overflow → trigger a useless compact-and-retry.
 
 **Fix**: catch `openai.BadRequestError` specifically and inspect `e.code` / `e.body` for known overflow markers (`"context_length_exceeded"`, `"string_above_max_length"`, status 400 with body containing `maximum context length`). Everything else propagates as-is and the loop emits `Terminal("model_error")`. Keep a string-match fallback for OSS endpoints that don't return structured codes, but only inside the `BadRequestError` branch (not all exceptions).
@@ -55,7 +55,7 @@ except BadRequestError as e:
     raise
 ```
 
-#### 1c. Sanitized tool error messages (`slim_agent/tools.py`)
+#### 1c. Sanitized tool error messages (`agent/tools.py`)
 **Problem**: `_run_one` exception path returns `ToolResult(output=str(e))`. `str(e)` from a tool may include filesystem paths, SQL queries, secrets in stack traces. The output goes back to the LLM as a tool result, then into model context, then potentially back to other tools.
 
 **Fix**: by default return a generic `f"{type(e).__name__}: tool failed"`. Add an `expose_tool_errors: bool = False` parameter to `run()` (and thread through `ToolContext`) for debug mode. Tool authors can still raise messages they consider safe — `Tool.call` returning `ToolResult(output=..., is_error=True)` is unaffected.
@@ -65,7 +65,7 @@ except BadRequestError as e:
 #### 2a. README rewrite (`README.md`)
 Replace the stub with:
 - One-paragraph "what / why" (~3 sentences)
-- Install: `uv add slim-agent`
+- Install: `uv add agent`
 - Minimal example: 20-line script that defines an `EchoTool`, builds an `OpenAICompatibleLLM` against Ollama, and prints text deltas
 - Tool authoring section: ~10 lines showing the Protocol surface (`name`, `description`, `input_model`, `call`, `is_concurrency_safe`)
 - Subagent example: 10 lines registering `Spawn`
@@ -75,7 +75,7 @@ Replace the stub with:
 
 #### 2b. Public-surface docstrings
 Add concise docstrings to:
-- `slim_agent.run` — args, yielded events, terminal reasons
+- `agent.run` — args, yielded events, terminal reasons
 - `OpenAICompatibleLLM.__init__` — note `context_window` must match the model
 - `Tool` Protocol — three required attrs + two methods
 - `ToolRegistry.register` — replaces existing tool with same name
@@ -84,21 +84,21 @@ Add concise docstrings to:
 
 Keep docstrings ≤ 5 lines each. No examples in docstrings (those go in README).
 
-#### 2c. `py.typed` marker (`slim_agent/py.typed`)
+#### 2c. `py.typed` marker (`agent/py.typed`)
 Empty file. Add to `[tool.hatch.build.targets.wheel]` package data so it ships in the wheel:
 ```toml
 [tool.hatch.build.targets.wheel]
-packages = ["slim_agent"]
+packages = ["agent"]
 [tool.hatch.build.targets.wheel.force-include]
-"slim_agent/py.typed" = "slim_agent/py.typed"
+"agent/py.typed" = "agent/py.typed"
 ```
 
 ### 3. Small cleanups
 
-#### 3a. Drop dead `system` param (`slim_agent/compact.py`)
+#### 3a. Drop dead `system` param (`agent/compact.py`)
 `maybe_compact(state, llm, system)` accepts `system` only for API consistency, then uses `_ = system` to silence Pyright. Remove the parameter entirely. Update the two callers in `loop.py` (lines 63 and 95) to drop the third arg.
 
-#### 3b. `DEFAULT_SUB_TOOLS=None` semantics (`slim_agent/builtin/spawn.py`)
+#### 3b. `DEFAULT_SUB_TOOLS=None` semantics (`agent/builtin/spawn.py`)
 Currently `DEFAULT_SUB_TOOLS: list[str] = []` and an empty `args.tools` produces a sub-agent with **no** tools. The plan said "empty = read-only default."
 
 **Fix**: change the SpawnArgs default to `tools: list[str] | None = None`. In `Spawn.call`:
@@ -110,7 +110,7 @@ Implementation: don't try to construct default args. Instead, inspect the JSON S
 
 Alternative if the above is too clever: keep `args.tools is None` meaning "all parent tools except Spawn", let `is_concurrency_safe` and the model figure it out. **Pick this simpler version** unless tests reveal a concrete problem.
 
-#### 3c. Deduplicate args validation (`slim_agent/tools.py`)
+#### 3c. Deduplicate args validation (`agent/tools.py`)
 `_partition_calls` validates args via `tool.input_model.model_validate(call.arguments)` then discards them; `_run_one` re-validates. For each call, validation runs twice.
 
 **Fix**: cache validated args on the `_Batch` (or pass parsed args alongside the call). Smallest change: in `_partition_calls`, build a list of `(call, parsed_args | None)` tuples. Pass parsed args into `_run_one` as an optional pre-parsed argument. If `None`, `_run_one` parses (handles the eager-start path where partition hasn't run).
@@ -169,13 +169,13 @@ Tests:
 
 | Path | Change |
 |---|---|
-| `slim_agent/loop.py` | Wrap body in try/finally for executor cleanup; drop 3rd arg from `maybe_compact` calls; thread `expose_tool_errors` |
-| `slim_agent/llm.py` | Replace string-match overflow detection with `BadRequestError`-typed branch; accept `_client` for DI |
-| `slim_agent/tools.py` | Sanitize `_run_one` error path (default + opt-in); thread flag via `ToolContext`; (optional) cache parsed args from partition |
-| `slim_agent/compact.py` | Drop `system` parameter and dead `_ = system` line |
-| `slim_agent/builtin/spawn.py` | `tools: list[str] \| None = None` default; "all parent tools except Spawn" semantics when None |
-| `slim_agent/__init__.py` | Add docstring; re-export anything new |
-| `slim_agent/py.typed` | New empty file |
+| `agent/loop.py` | Wrap body in try/finally for executor cleanup; drop 3rd arg from `maybe_compact` calls; thread `expose_tool_errors` |
+| `agent/llm.py` | Replace string-match overflow detection with `BadRequestError`-typed branch; accept `_client` for DI |
+| `agent/tools.py` | Sanitize `_run_one` error path (default + opt-in); thread flag via `ToolContext`; (optional) cache parsed args from partition |
+| `agent/compact.py` | Drop `system` parameter and dead `_ = system` line |
+| `agent/builtin/spawn.py` | `tools: list[str] \| None = None` default; "all parent tools except Spawn" semantics when None |
+| `agent/__init__.py` | Add docstring; re-export anything new |
+| `agent/py.typed` | New empty file |
 | `pyproject.toml` | `force-include` clause for `py.typed` |
 | `README.md` | Full rewrite per 2a |
 | `tests/test_loop.py`, `tests/test_spawn.py`, `tests/test_tools.py`, `tests/test_compact.py` | New tests per §4 |
@@ -183,9 +183,9 @@ Tests:
 
 ## Existing patterns to reuse
 
-- `StreamingExecutor.drain_with_synthetic_errors` (`slim_agent/tools.py:177`) — already handles cancel-and-yield. Reuse for the loop's `finally` cleanup; no new code needed.
-- `ContextOverflowError` (`slim_agent/llm.py:11`) — keep the exception class; only the detection logic changes.
-- `ToolContext` (`slim_agent/tools.py:10`) — add `expose_tool_errors: bool = False` field; the class is already extensible by design.
+- `StreamingExecutor.drain_with_synthetic_errors` (`agent/tools.py:177`) — already handles cancel-and-yield. Reuse for the loop's `finally` cleanup; no new code needed.
+- `ContextOverflowError` (`agent/llm.py:11`) — keep the exception class; only the detection logic changes.
+- `ToolContext` (`agent/tools.py:10`) — add `expose_tool_errors: bool = False` field; the class is already extensible by design.
 - The `FakeLLM` / `ScriptedTurn` pattern in `tests/test_loop.py:18-53` — reuse for the new loop tests; no need to redesign.
 - The `ScriptedLLM` and `Dispatcher` patterns in `tests/test_spawn.py` — reuse for new spawn tests.
 
@@ -202,7 +202,7 @@ Smoke check the README example:
 ```bash
 .venv/bin/python -c "
 import asyncio
-from slim_agent import run, ToolRegistry
+from agent import run, ToolRegistry
 async def main():
     print('imports ok')
 asyncio.run(main())
@@ -212,9 +212,9 @@ asyncio.run(main())
 Distribution check:
 ```bash
 uv build
-unzip -l dist/slim_agent-0.1.0-py3-none-any.whl | grep py.typed
+unzip -l dist/agent-0.1.0-py3-none-any.whl | grep py.typed
 ```
-Expected: `slim_agent/py.typed` is present in the wheel.
+Expected: `agent/py.typed` is present in the wheel.
 
 ## Explicit non-goals (skipped intentionally)
 

@@ -5,14 +5,14 @@ from dataclasses import dataclass
 from typing import Any
 from pydantic import BaseModel
 
-from slim_agent import (
+from agent import (
     run, LoopState, ToolRegistry, ToolContext, ToolResult,
     TextDelta, ToolCallComplete, AssistantMessageComplete, Terminal,
     MaxTurnsReached, ToolLoopDetected, ContextOverflow, ModelError,
     TurnStart, ToolCall, AssistantMessage,
 )
-from slim_agent.llm import ContextOverflowError
-from slim_agent.events import ToolResult as ToolResultEv
+from agent.llm import ContextOverflowError
+from agent.events import ToolResult as ToolResultEv
 
 
 @dataclass

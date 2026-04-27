@@ -3,15 +3,15 @@ import platform
 
 import pytest
 
-from slim_agent.builtin.shell import (
+from agent.builtin.shell import (
     Shell,
     ShellArgs,
     detect_shell_backend,
     _truncate,
 )
-from slim_agent.builtin.web_fetch import _validate_url, _to_markdown
-from slim_agent.builtin.web_search import _parse_results, _unwrap_ddg_redirect
-from slim_agent.cli import (
+from agent.builtin.web_fetch import _validate_url, _to_markdown
+from agent.builtin.web_search import _parse_results, _unwrap_ddg_redirect
+from agent.cli import (
     APP_NAME,
     SUPPORTED_SERVICES,
     _build_parser,
@@ -19,7 +19,7 @@ from slim_agent.cli import (
     cmd_doctor,
     cmd_models,
 )
-from slim_agent.tools import ToolContext
+from agent.tools import ToolContext
 
 
 def test_app_name_is_kent():

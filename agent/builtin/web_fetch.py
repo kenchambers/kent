@@ -27,7 +27,7 @@ MAX_HTTP_CONTENT_LENGTH = 10 * 1024 * 1024  # 10 MB
 FETCH_TIMEOUT_SECONDS = 30.0
 MAX_MARKDOWN_LENGTH = 100_000  # chars
 DEFAULT_USER_AGENT = (
-    "slim-agent/0.1 (+https://github.com/) httpx web_fetch tool"
+    "agent/0.1 (+https://github.com/) httpx web_fetch tool"
 )
 
 

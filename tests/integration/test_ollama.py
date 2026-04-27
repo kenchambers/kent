@@ -1,8 +1,8 @@
 import os
 import pytest
 from pydantic import BaseModel
-from slim_agent import run, ToolRegistry, ToolResult, Terminal, OpenAICompatibleLLM
-from slim_agent.events import TextDelta
+from agent import run, ToolRegistry, ToolResult, Terminal, OpenAICompatibleLLM
+from agent.events import TextDelta
 
 pytestmark = pytest.mark.integration
 

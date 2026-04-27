@@ -2,8 +2,8 @@ import json
 import pytest
 from unittest.mock import MagicMock
 
-from slim_agent.llm import OpenAICompatibleLLM, ContextOverflowError
-from slim_agent.events import TextDelta, ToolCallStart, ToolCallDelta, ToolCallComplete, AssistantMessageComplete
+from agent.llm import OpenAICompatibleLLM, ContextOverflowError
+from agent.events import TextDelta, ToolCallStart, ToolCallDelta, ToolCallComplete, AssistantMessageComplete
 
 
 def _make_mock_client(chunks_or_exc):

@@ -1,8 +1,8 @@
 import asyncio
 import pytest
 from pydantic import BaseModel
-from slim_agent.tools import ToolRegistry, StreamingExecutor, _partition_calls, ToolContext
-from slim_agent.events import ToolCall, ToolResult
+from agent.tools import ToolRegistry, StreamingExecutor, _partition_calls, ToolContext
+from agent.events import ToolCall, ToolResult
 
 
 class ReadTool:

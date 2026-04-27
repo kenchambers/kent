@@ -1,7 +1,7 @@
 import pytest
 
-from slim_agent.critic import critique, _format
-from slim_agent.events import TextDelta
+from agent.critic import critique, _format
+from agent.events import TextDelta
 
 
 class _FakeLLM:

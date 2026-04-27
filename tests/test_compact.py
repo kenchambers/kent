@@ -1,9 +1,9 @@
 import asyncio
 import json
 import pytest
-from slim_agent.state import LoopState
-from slim_agent.compact import maybe_compact, COMPACT_THRESHOLD
-from slim_agent.events import TextDelta, AssistantMessageComplete, AssistantMessage
+from agent.state import LoopState
+from agent.compact import maybe_compact, COMPACT_THRESHOLD
+from agent.events import TextDelta, AssistantMessageComplete, AssistantMessage
 
 
 class FakeLLMForCompact:
@@ -48,7 +48,7 @@ async def test_compact_triggers_above_threshold():
 
 @pytest.mark.asyncio
 async def test_compact_preserves_tail():
-    from slim_agent.compact import COMPACT_KEEP_TAIL
+    from agent.compact import COMPACT_KEEP_TAIL
     llm = FakeLLMForCompact(context_window=10, summary="summary")
     messages = tuple(
         {"role": "user", "content": f"msg{i}"} for i in range(20)
@@ -64,7 +64,7 @@ async def test_compact_preserves_tail():
 @pytest.mark.asyncio
 async def test_compact_no_op_when_short_history():
     """Over threshold but few messages (≤ COMPACT_KEEP_TAIL): no summarizer called."""
-    from slim_agent.compact import COMPACT_KEEP_TAIL
+    from agent.compact import COMPACT_KEEP_TAIL
     summarize_calls = []
 
     class TrackingLLM(FakeLLMForCompact):
