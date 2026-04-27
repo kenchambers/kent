@@ -30,6 +30,8 @@ The Python package is imported as `agent`; the installed CLI binary is `kent`.
   - [Event reference](#event-reference)
   - [Cancellation](#cancellation)
 - [Testing](#testing)
+- [Persistent memory](#persistent-memory)
+  - [Wings & diary](#wings--diary)
 - [Known limitations](#known-limitations)
 
 ## What this is
@@ -201,22 +203,34 @@ Health check. Prints OS / shell backend, web-search provider, config-file paths,
 
 ### Slash commands (in-REPL)
 
-| Command         | What it does                                |
-|-----------------|---------------------------------------------|
-| `/help`         | Show the slash command list                 |
-| `/tools`        | List registered tools                       |
-| `/model`        | Show service / model / context window       |
-| `/clear`        | Clear conversation history (keep the session) |
-| `/exit`, `/quit`| Leave the session                           |
+| Command                  | What it does                                       |
+|--------------------------|----------------------------------------------------|
+| `/help`                  | Show the slash command list                        |
+| `/tools`                 | List registered tools                              |
+| `/model`                 | Show service / model / context window              |
+| `/clear`                 | Clear conversation history (keep the session)      |
+| `/memory`                | Show palace path, transcript path, session ID, active wing |
+| `/recall <query>`        | Global semantic search over all drawers            |
+| `/recall-here <query>`   | Wing-scoped diary search (active wing only)        |
+| `/forget`                | Delete the current session's transcript (with confirmation) |
+| `/wing`                  | Show current active wing and its intent            |
+| `/wing <name>`           | Switch to a wing (must already exist)              |
+| `/wings`                 | List all wings with intents; `*` marks the active one |
+| `/diary <text>`          | Append an OBSERVATION to the active wing's diary   |
+| `/exit`, `/quit`         | Leave the session                                  |
 
 ## Built-in tools
 
-| Tool             | What it does                                                         | API key | Concurrency-safe |
-|------------------|----------------------------------------------------------------------|---------|------------------|
-| `web_search`     | DuckDuckGo HTML scraping — returns `[{title, url, snippet}]`         | none    | yes              |
-| `web_fetch`      | URL → markdown via httpx + markdownify (10 MB cap, 100K char output) | none    | yes              |
-| `shell`          | Host shell (bash on macOS/Linux/WSL, PowerShell on Windows)          | none    | no               |
-| `spawn_subagent` | Delegate a focused subtask with its own context window               | none    | yes              |
+| Tool                  | What it does                                                         | API key | Concurrency-safe |
+|-----------------------|----------------------------------------------------------------------|---------|------------------|
+| `web_search`          | DuckDuckGo HTML scraping — returns `[{title, url, snippet}]`         | none    | yes              |
+| `web_fetch`           | URL → markdown via httpx + markdownify (10 MB cap, 100K char output) | none    | yes              |
+| `shell`               | Host shell (bash on macOS/Linux/WSL, PowerShell on Windows)          | none    | no               |
+| `spawn_subagent`      | Delegate a focused subtask with its own context window               | none    | yes              |
+| `memory_recall`       | Global semantic search over all session drawers                      | none    | yes              |
+| `memory_recall_here`  | Wing-scoped semantic search over the active wing's diary             | none    | yes              |
+| `diary_write`         | Append an entry (OBSERVATION / FINDING / DECISION / PATTERN) to the active wing's diary | none | no |
+| `set_wing`            | Switch to or register a named project wing                           | none    | no               |
 
 Concurrency-safe tools batch and run in parallel via `StreamingExecutor`; unsafe tools (like `shell`) serialize so they can't race state mutations.
 
@@ -232,16 +246,21 @@ Adding a new service: edit `SUPPORTED_SERVICES` in `agent/cli.py` — it's a dic
 
 Files live under `~/.kent/` (override with `KENT_HOME=/some/path`):
 
-| File                              | Contents                              | Notes                          |
-|-----------------------------------|---------------------------------------|--------------------------------|
-| `~/.kent/config.json`             | `{service_id, model}`                 | Non-secret; written on first run |
-| `~/.kent/credentials.json`        | `{<service_id>: <api_key>, …}`        | Written by `kent auth`; chmod 0600 |
+| File / Dir                           | Contents                              | Notes                          |
+|--------------------------------------|---------------------------------------|--------------------------------|
+| `~/.kent/config.json`                | `{service_id, model}`                 | Non-secret; written on first run |
+| `~/.kent/credentials.json`           | `{<service_id>: <api_key>, …}`        | Written by `kent auth`; chmod 0600 |
+| `~/.kent/active_wing.txt`            | Current wing name (one line)          | Updated by `set_wing` tool / `/wing` / `--wing` |
+| `~/.kent/diaries/<wing>/`            | Per-wing diary directory              | Created on first diary write |
+| `~/.kent/diaries/<wing>/.intent.txt` | One-line wing description             | Written at wing creation |
+| `~/.kent/diaries/<wing>/YYYY-MM-DD.md` | Daily diary entries               | Append-only; ingested into palace |
 
 Override with environment:
 
 | Variable               | Effect                                                       |
 |------------------------|--------------------------------------------------------------|
 | `KENT_HOME`            | Use a different config dir (default `~/.kent`)               |
+| `KENT_WING`            | Set the active wing for a session (overrides `active_wing.txt`) |
 | `ATLASCLOUD_API_KEY`   | Atlas Cloud API key — wins over saved credential             |
 
 ## Library use
@@ -388,13 +407,12 @@ Kent uses a deliberately small surface of mempalace's API. The full library ship
 | `mempalace.layers.Layer3(palace_path).search(query, n_results=k)` | `memory_recall` tool, `/recall` slash command | Deep semantic search over all drawers. We use `Layer3.search` rather than `searcher.search` because the latter prints to stdout instead of returning. |
 | `mempalace.sweeper.parse_claude_jsonl(path)` | `tests/test_memory_transcript.py` only | Used to verify that our transcript writer produces JSONL conformant with mempalace's reader |
 
-**Why no `wing` filter?** The plan originally called for `wing="kent"` as an isolation filter, but mempalace's `sweeper.sweep()` does not write a `wing` field to drawer metadata — only `mempalace mine`, `diary_ingest`, and a few other paths set wings. Filtering sweeper-ingested drawers by wing returns nothing. Kent achieves isolation by owning a separate ChromaDB palace (`~/.kent/palace`) instead of sharing `~/.mempalace/palace` with other tools.
+**Sweeper-ingested turns carry no `wing` metadata.** Mempalace's `sweeper.sweep()` does not write a `wing` field to drawer metadata — only `diary_ingest` and a few other paths set wings. Kent achieves palace isolation by owning a separate ChromaDB at `~/.kent/palace` instead of sharing `~/.mempalace/palace` with other tools. Wings are used exclusively for the diary path (see [Wings & diary](#wings--diary)).
 
-What we **don't** use:
-- **L2 (`stack.recall(wing, room)`)** — wing/room scoped retrieval. Sweeper-ingested drawers have no wing metadata, so the filter doesn't apply to our ingest path.
-- **`mempalace.convo_miner.mine_convos`** — batch-import path for an existing corpus of Claude transcripts. Kent streams live, so it goes through `sweep` per turn instead.
-- **The 29 MCP tools** — kent isn't an MCP host; mempalace is used as a Python library, not an MCP server.
-- **Direct ChromaDB writes** — `sweep` handles dedup and the post-1.5.4 hnswlib quirks. We never reach into the chromadb collection ourselves.
+What we **don't** use from MemPalace on the sweeper path:
+- **`mempalace.convo_miner.mine_convos`** — batch-import for an existing corpus. Kent streams live via `sweep` per turn.
+- **The 29 MCP tools** — kent isn't an MCP host; mempalace is used as a Python library.
+- **Direct ChromaDB writes** — `sweep` handles dedup. We never reach into the chromadb collection ourselves.
 
 ### How a turn flows through MemPalace
 
@@ -439,6 +457,95 @@ On the **read side**, two paths surface stored memory back to the model:
 2. **`memory_recall` tool** (on-demand). The model can call `memory_recall(query, k=5)` whenever a question references prior context. This routes to `Layer3.search`, which does semantic vector search over all drawers and returns formatted text the model can quote back.
 
 The two paths are complementary: wake-up gives the model passive priming with the most "essential" L1 moments; `memory_recall` gives it active retrieval for specific queries that wake-up didn't surface.
+
+### Wings & diary
+
+Kent supports **wings** — named project/intent contexts — and a per-wing **agent diary** that captures the model's observations, findings, decisions, and recurring patterns across sessions.
+
+#### Filesystem layout
+
+All wing state lives under `${KENT_HOME}` (default `~/.kent/`):
+
+```
+~/.kent/
+├── palace/                     # ChromaDB — conversation turns (sweeper path)
+├── active_wing.txt             # one line: current wing name
+└── diaries/
+    ├── kent_default/
+    │   ├── .intent.txt         # one-line wing description
+    │   ├── 2026-04-27.md       # today's diary entries
+    │   └── 2026-04-28.md
+    └── prod-deploys/
+        ├── .intent.txt
+        └── 2026-04-27.md
+```
+
+The directory layout *is* the wing registry. `list_wings()` = `ls ~/.kent/diaries/`. No separate registry file.
+
+#### Wing creation flow
+
+Wings are created on demand. When the model encounters a new project intent:
+
+1. Model calls `set_wing(name="prod-deploys")` — no wing exists yet → returns an error telling the model to ask the user for a one-line description and re-call.
+2. User confirms; model calls `set_wing(name="prod-deploys", intent="monitor terraform deploy pipeline")`.
+3. Wing directory and `.intent.txt` are written; store switches to that wing.
+
+You can also switch wings directly from the REPL:
+
+```
+/wing prod-deploys        # switch (must exist)
+/wings                    # list all wings with intents
+/wing                     # show current active wing
+kent --wing prod-deploys  # set wing for the whole session
+```
+
+#### Writing diary entries
+
+```
+/diary the build slowed 30% after midnight
+```
+
+…or the model calls `diary_write(kind="OBSERVATION", text="...", topic="builds")`.
+
+Valid kinds: `OBSERVATION`, `FINDING`, `DECISION`, `PATTERN`.
+
+Entries are appended to `~/.kent/diaries/<wing>/YYYY-MM-DD.md` under `fcntl.flock` and immediately ingested into ChromaDB via `mempalace.diary_ingest.ingest_diaries`. The format matches the diary spec from mempalace:
+
+```markdown
+# 2026-04-27
+
+## 14:32:01 [agent=kent] [OBSERVATION] builds
+The build pipeline got 30% slower after midnight.
+
+## 15:08:44 [agent=kent] [DECISION] feature-flags
+Decided to gate the new ranker behind FF_RANKER_V2.
+```
+
+#### Recalling diary entries
+
+Two surfaces:
+
+| Surface | When to use |
+|---|---|
+| `memory_recall_here(query)` / `/recall-here <q>` | Active search — semantic lookup in current wing's diary |
+| Session wake-up (automatic) | Passive priming — `wake_up_full()` injects both global L0+L1 AND recent wing diary content at session start |
+
+**Wing-scoped recall is diary-only.** Turn transcripts ingested by `sweeper.sweep()` carry no `wing` metadata, so `memory_recall_here` only surfaces diary entries (written via `diary_write`). Use `memory_recall` for cross-session turn retrieval.
+
+#### Session start vs. compaction
+
+| Event | Which wake-up | Why |
+|---|---|---|
+| Session start (`kent`, `kent run`) | `wake_up_full()` — global + wing diary | Fresh session benefits from full context |
+| Compaction (`maybe_compact`) | `wake_up()` — global only | Saves tokens on every mid-session compaction; diary still reachable via `memory_recall_here` |
+
+#### Caveats
+
+- **Diary is append-only.** Editing requires manually modifying the `.md` file and re-running ingest with `force=True`. `/forget` only removes the current session's turn transcript — diary entries persist.
+- **Wing rename/delete not supported** in v1. Renaming orphans drawers (different `(wing, date)` hash in ChromaDB). Work around with `rm -rf ~/.kent/diaries/<old>` + manual ChromaDB cleanup.
+- **Secrets caveat applies to diaries too.** Anything written to a diary entry is stored verbatim in ChromaDB. Use `mempalace` tools or `rm -rf ~/.kent/palace` to wipe.
+- **`~/.mempalace/state/` side effect.** `ingest_diaries` writes a small state file under `~/.mempalace/state/` (hard-coded inside mempalace). The file is SHA-keyed by `(palace_path, diary_dir)` so no collision is possible with other mempalace tools. You can delete it freely.
+- **Subagents inherit the active wing.** When `spawn_subagent` is called, the subagent shares the parent's `MemPalaceStore` and therefore the same `active_wing`. Wing mutations by a subagent via `set_wing` affect the parent's state on the next turn.
 
 ### Crash safety and error handling
 

@@ -19,8 +19,11 @@ from .builtin.spawn import Spawn
 from .builtin.web_search import WebSearch
 from .builtin.web_fetch import WebFetch
 from .builtin.shell import Shell, ShellBackend, detect_shell_backend
-from .memory import MemoryStore, MemPalaceStore
+from .memory import MemoryStore, WingedMemoryStore, MemPalaceStore
 from .builtin.memory_recall import MemoryRecall
+from .builtin.memory_recall_here import MemoryRecallHere
+from .builtin.diary_write import DiaryWrite
+from .builtin.set_wing import SetWing
 
 __all__ = [
     "run",
@@ -36,5 +39,6 @@ __all__ = [
     "MaxTurnsReached", "ToolLoopDetected", "Terminal",
     "Spawn", "WebSearch", "WebFetch",
     "Shell", "ShellBackend", "detect_shell_backend",
-    "MemoryStore", "MemPalaceStore", "MemoryRecall",
+    "MemoryStore", "WingedMemoryStore", "MemPalaceStore",
+    "MemoryRecall", "MemoryRecallHere", "DiaryWrite", "SetWing",
 ]

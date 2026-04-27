@@ -23,47 +23,125 @@ _TRANSCRIPT_BASE = Path(
 #     so the documented wing-based isolation does not apply to our ingest path
 #   - a separate palace gives us total physical isolation: no cross-contamination
 #     from `mempalace mine`, the MCP server, or other mempalace consumers
-_DEFAULT_PALACE = Path(
-    os.environ.get("KENT_HOME", str(Path.home() / ".kent"))
-) / "palace"
+_DEFAULT_KENT_HOME = Path(os.environ.get("KENT_HOME", str(Path.home() / ".kent")))
+_DEFAULT_PALACE = _DEFAULT_KENT_HOME / "palace"
 
 
 class MemPalaceStore:
-    """MemPalace-backed persistent memory. Default store for agent.run()."""
+    """MemPalace-backed persistent memory with wing + diary support."""
 
-    def __init__(self, *, palace_path: Path | None = None) -> None:
-        self._palace_path: Path = palace_path if palace_path is not None else _DEFAULT_PALACE
+    def __init__(
+        self,
+        *,
+        palace_path: Path | None = None,
+        kent_home: Path | None = None,
+    ) -> None:
+        from .wings import read_active_wing
+
+        self._kent_home: Path = kent_home if kent_home is not None else _DEFAULT_KENT_HOME
+        self._palace_path: Path = palace_path if palace_path is not None else self._kent_home / "palace"
         self._session_id: str = uuid.uuid4().hex
         self._transcript_path: Path = _TRANSCRIPT_BASE / f"{self._session_id}.jsonl"
+        self._active_wing: str = read_active_wing(home=self._kent_home)
 
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def active_wing(self) -> str:
+        return self._active_wing
+
+    @property
+    def kent_home(self) -> Path:
+        return self._kent_home
+
+    @property
+    def palace_path(self) -> Path:
+        return self._palace_path
+
+    @property
+    def transcript_path(self) -> Path:
+        return self._transcript_path
+
+    def set_active_wing(self, name: str) -> None:
+        from .wings import sanitize_wing, write_active_wing
+
+        clean = sanitize_wing(name)
+        self._active_wing = clean
+        write_active_wing(clean, home=self._kent_home)
 
     def record_turn(self, messages: list["Message"], *, session_id: str) -> None:
         if not messages:
             return
         try:
             from mempalace.sweeper import sweep
+
             append_messages(self._transcript_path, messages, session_id=session_id)
             sweep(str(self._transcript_path), str(self._palace_path), source_label="kent")
         except Exception:
             logger.warning("MemPalaceStore.record_turn failed", exc_info=True)
 
     def wake_up(self) -> str:
+        """Global-only wake-up. Used by compact.py — keeps compaction tokens bounded."""
         try:
             from mempalace.layers import MemoryStack
-            # Don't filter by wing — sweeper-stored records have no wing metadata field
+
             return MemoryStack(str(self._palace_path)).wake_up()
         except Exception:
             logger.warning("MemPalaceStore.wake_up failed", exc_info=True)
             return ""
 
+    def wake_up_full(self) -> str:
+        """Global wake-up + wing-scoped diary recall. Used at session start only."""
+        global_text = self.wake_up()
+
+        wing_text = ""
+        try:
+            from mempalace.layers import MemoryStack
+
+            result = MemoryStack(str(self._palace_path)).recall(
+                wing=self._active_wing, room="daily", n_results=10
+            )
+            stripped = (result or "").strip()
+            if stripped and not stripped.startswith(("No drawers found", "No palace")):
+                wing_text = stripped
+        except Exception:
+            logger.warning(
+                "MemPalaceStore.wake_up_full wing-scoped recall failed", exc_info=True
+            )
+
+        if global_text and wing_text:
+            return global_text + "\n\n" + wing_text
+        return global_text or wing_text
+
     def recall(self, query: str, k: int = 5) -> str:
         try:
             from mempalace.layers import Layer3
-            # Don't filter by wing — sweeper-stored records have no wing metadata field
+
             return Layer3(str(self._palace_path)).search(query, n_results=k)
         except Exception:
             logger.warning("MemPalaceStore.recall failed", exc_info=True)
             return ""
+
+    def recall_in_wing(self, query: str, k: int = 5) -> str:
+        """Wing-scoped diary recall via Layer3 with wing + room filter."""
+        try:
+            from mempalace.layers import Layer3
+
+            return Layer3(str(self._palace_path)).search(
+                query, wing=self._active_wing, room="daily", n_results=k
+            )
+        except Exception:
+            logger.warning("MemPalaceStore.recall_in_wing failed", exc_info=True)
+            return ""
+
+    def write_diary(self, kind: str, text: str, *, topic: str | None = None) -> None:
+        try:
+            from .diary import DiaryWriter
+
+            DiaryWriter(self._palace_path, self._kent_home).write(
+                self._active_wing, kind, text, topic=topic
+            )
+        except Exception:
+            logger.warning("MemPalaceStore.write_diary failed", exc_info=True)

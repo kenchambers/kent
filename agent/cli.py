@@ -12,7 +12,9 @@ Layout follows the pattern of opencode / hermes-agent / claude-code:
 
 Inside the REPL, slash commands:
   /help    /tools    /model    /clear    /exit
-  /memory  /recall <query>    /forget
+  /memory  /recall <query>    /recall-here <query>    /forget
+  /wing    /wing <name>       /wings
+  /diary <text>
 """
 from __future__ import annotations
 
@@ -62,16 +64,75 @@ SUPPORTED_SERVICES: dict[str, dict[str, Any]] = {
     },
 }
 
-SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_BASE = (
     "You are kent, a terminal AI agent. You have these tools: "
     "web_search (DuckDuckGo HTML, no API key), web_fetch (URL → markdown), "
     "shell (host shell — bash on macOS/Linux/WSL, PowerShell on Windows), "
     "spawn_subagent (delegate a focused subtask), "
-    "memory_recall (search long-term memory from previous sessions). "
+    "memory_recall (search long-term memory from previous sessions), "
+    "memory_recall_here (search the active project wing's diary), "
+    "diary_write (record observations, findings, decisions, patterns), "
+    "set_wing (switch or register a named project context). "
     "Prefer web_search before web_fetch. Prefer shell over re-implementing with another tool. "
     "Use memory_recall when the user asks about things you might have discussed before. "
+    "Use memory_recall_here for project-specific context. "
+    "Use diary_write to capture important observations, decisions, or patterns. "
     "Keep responses concise."
 )
+
+# Kept for backward compatibility with external imports
+SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE
+
+
+def _build_system_prompt(memory_store: "MemoryStore | None" = None) -> str:
+    """Build the system prompt, optionally appending current wings list."""
+    base = _SYSTEM_PROMPT_BASE
+    if memory_store is None:
+        return base
+    try:
+        from .memory.mempalace_store import MemPalaceStore
+        from .memory.wings import list_wings, read_intent
+
+        if not isinstance(memory_store, MemPalaceStore):
+            return base
+
+        home = memory_store.kent_home
+        all_wings = list_wings(home=home)
+        if not all_wings:
+            return base
+
+        # Sort by mtime (most recently modified first), cap at 20
+        def _wing_mtime(w: str) -> float:
+            try:
+                return (home / "diaries" / w).stat().st_mtime
+            except OSError:
+                return 0.0
+
+        sorted_wings = sorted(all_wings, key=_wing_mtime, reverse=True)
+        cap = 20
+        overflow = len(sorted_wings) - cap
+        displayed = sorted_wings[:cap]
+
+        active = memory_store.active_wing
+        wing_lines: list[str] = []
+        for w in displayed:
+            intent = read_intent(w, home=home)
+            intent_part = f" — {intent}" if intent else ""
+            marker = " (active)" if w == active else ""
+            wing_lines.append(f"  {w}{marker}{intent_part}")
+
+        overflow_note = f"\n  (and {overflow} more — use /wings)" if overflow > 0 else ""
+        return (
+            base
+            + "\n\nActive project wings:\n"
+            + "\n".join(wing_lines)
+            + overflow_note
+            + "\nWhen the user states a project intent that doesn't match an existing wing, "
+            "propose set_wing(name='...') after confirming the name with the user, "
+            "then call again with intent='...' to register."
+        )
+    except Exception:
+        return base
 
 
 # ---------- config / credentials persistence ------------------------------- #
@@ -285,6 +346,14 @@ def _make_critic_llm(choice: StartupChoice) -> OpenAICompatibleLLM | None:
     )
 
 
+def _resolve_wing(args: argparse.Namespace) -> str | None:
+    """Return explicitly-requested wing name, or None (store constructor handles default)."""
+    wing = getattr(args, "wing", None)
+    if wing:
+        return wing
+    return os.environ.get("KENT_WING") or None
+
+
 async def _run_once(
     registry: ToolRegistry,
     llm: OpenAICompatibleLLM,
@@ -293,6 +362,7 @@ async def _run_once(
     *,
     quiet_tools: bool = False,
     memory_store: "MemoryStore | None" = None,
+    system_prompt: str = _SYSTEM_PROMPT_BASE,
 ) -> tuple[list[dict], str]:
     """Single agent turn. Returns (new_history, terminal_reason)."""
     history = [*history, {"role": "user", "content": user_input}]
@@ -302,7 +372,7 @@ async def _run_once(
         messages=history,
         tools=registry,
         llm=llm,
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         max_turns=15,
         memory_store=memory_store,
     ):
@@ -337,6 +407,7 @@ async def _stream_one_turn(
     critic_llm: LLM | None = None,
     quiet_tools: bool = False,
     memory_store: "MemoryStore | None" = None,
+    system_prompt: str = _SYSTEM_PROMPT_BASE,
 ) -> tuple[list[dict], str]:
     """
     Run one turn; if a critic is provided and the turn completed cleanly,
@@ -345,6 +416,7 @@ async def _stream_one_turn(
     history, reason = await _run_once(
         registry, llm, history, user_input,
         quiet_tools=quiet_tools, memory_store=memory_store,
+        system_prompt=system_prompt,
     )
     if critic_llm is None or reason != "completed":
         return history, reason
@@ -363,6 +435,7 @@ async def _stream_one_turn(
     return await _run_once(
         registry, llm, history, injected,
         quiet_tools=quiet_tools, memory_store=memory_store,
+        system_prompt=system_prompt,
     )
 
 
@@ -370,14 +443,19 @@ async def _stream_one_turn(
 
 SLASH_HELP = """\
 slash commands:
-  /help            show this list
-  /tools           list registered tools
-  /model           show current service / model
-  /clear           clear conversation history
-  /memory          show memory store info
-  /recall <query>  search long-term memory
-  /forget          delete current session transcript (with confirmation)
-  /exit, /quit     leave the session
+  /help                  show this list
+  /tools                 list registered tools
+  /model                 show current service / model
+  /clear                 clear conversation history
+  /memory                show memory store info
+  /recall <query>        search long-term memory (global)
+  /recall-here <query>   search active wing's diary
+  /forget                delete current session transcript (with confirmation)
+  /wing                  show active wing
+  /wing <name>           switch to a wing (must exist)
+  /wings                 list all wings with intents
+  /diary <text>          record an OBSERVATION in the active wing's diary
+  /exit, /quit           leave the session
 """
 
 
@@ -415,13 +493,30 @@ def _handle_slash(
             try:
                 from .memory.mempalace_store import MemPalaceStore
                 if isinstance(memory_store, MemPalaceStore):
-                    palace = memory_store._palace_path
-                    transcript = memory_store._transcript_path
+                    palace = memory_store.palace_path
+                    transcript = memory_store.transcript_path
                     print(f"  palace     : {palace}  (exists: {palace.exists()})")
                     print(f"  transcript : {transcript}  (exists: {transcript.exists()})")
                     print(f"  session id : {memory_store.session_id}")
+                    print(f"  wing       : {memory_store.active_wing}")
                 else:
                     print(f"  session id : {memory_store.session_id}")
+            except Exception as e:
+                print(f"  error: {e}")
+    elif head.startswith("/recall-here"):
+        query = cmd_stripped[len("/recall-here"):].strip()
+        if not query:
+            print("usage: /recall-here <query>")
+        elif memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                if isinstance(memory_store, MemPalaceStore):
+                    result = memory_store.recall_in_wing(query)
+                    print(result or f"(no memories found in wing '{memory_store.active_wing}')")
+                else:
+                    print("wing-scoped recall not supported for this store type")
             except Exception as e:
                 print(f"  error: {e}")
     elif head.startswith("/recall"):
@@ -440,7 +535,7 @@ def _handle_slash(
             try:
                 from .memory.mempalace_store import MemPalaceStore
                 if isinstance(memory_store, MemPalaceStore):
-                    transcript = memory_store._transcript_path
+                    transcript = memory_store.transcript_path
                     try:
                         confirm = input(
                             "Delete current session transcript? (y/N): "
@@ -463,6 +558,86 @@ def _handle_slash(
                     print("forget not supported for this store type")
             except Exception as e:
                 print(f"  error: {e}")
+    elif head == "/wing":
+        if memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                from .memory.wings import read_intent
+                if isinstance(memory_store, MemPalaceStore):
+                    w = memory_store.active_wing
+                    intent = read_intent(w, home=memory_store.kent_home)
+                    intent_part = f" — {intent}" if intent else ""
+                    print(f"  active wing: {w}{intent_part}")
+                else:
+                    print("wings not supported for this store type")
+            except Exception as e:
+                print(f"  error: {e}")
+    elif head.startswith("/wing "):
+        name = cmd_stripped[len("/wing "):].strip()
+        if not name:
+            print("usage: /wing <name>")
+        elif memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                from .memory.wings import list_wings, sanitize_wing, read_intent
+                if isinstance(memory_store, MemPalaceStore):
+                    clean = sanitize_wing(name)
+                    existing = list_wings(home=memory_store.kent_home)
+                    if clean not in existing:
+                        print(
+                            f"  wing {clean!r} doesn't exist. "
+                            "Use set_wing tool or /wings to see available wings."
+                        )
+                    else:
+                        memory_store.set_active_wing(clean)
+                        intent = read_intent(clean, home=memory_store.kent_home)
+                        intent_part = f" — {intent}" if intent else ""
+                        print(f"  switched to wing {clean!r}{intent_part}")
+                else:
+                    print("wings not supported for this store type")
+            except ValueError as e:
+                print(f"  error: {e}")
+            except Exception as e:
+                print(f"  error: {e}")
+    elif head == "/wings":
+        try:
+            from .memory.mempalace_store import MemPalaceStore
+            from .memory.wings import list_wings, read_intent
+            if memory_store is not None and isinstance(memory_store, MemPalaceStore):
+                wings = list_wings(home=memory_store.kent_home)
+                active = memory_store.active_wing
+                if not wings:
+                    print("  no wings yet. Use set_wing tool to create one.")
+                else:
+                    for w in wings:
+                        intent = read_intent(w, home=memory_store.kent_home)
+                        marker = " *" if w == active else "  "
+                        intent_part = f" — {intent}" if intent else ""
+                        print(f"{marker} {w}{intent_part}")
+            else:
+                print("wings not supported for this store type")
+        except Exception as e:
+            print(f"  error: {e}")
+    elif head.startswith("/diary"):
+        text = cmd_stripped[len("/diary"):].strip()
+        if not text:
+            print("usage: /diary <text>")
+        elif memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                if isinstance(memory_store, MemPalaceStore):
+                    memory_store.write_diary("OBSERVATION", text)
+                    print(f"  [diary] OBSERVATION recorded in wing '{memory_store.active_wing}'")
+                else:
+                    print("diary not supported for this store type")
+            except Exception as e:
+                print(f"  error: {e}")
     else:
         print(f"unknown slash command: {cmd!r}. /help for the list.")
     return history, False
@@ -470,21 +645,35 @@ def _handle_slash(
 
 # ---------- subcommands ---------------------------------------------------- #
 
-async def _repl(choice: StartupChoice) -> None:
+async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> None:
     from .memory import MemPalaceStore
     from .builtin.memory_recall import MemoryRecall
+    from .builtin.memory_recall_here import MemoryRecallHere
+    from .builtin.diary_write import DiaryWrite
+    from .builtin.set_wing import SetWing
 
     llm = _make_llm(choice)
     critic_llm = _make_critic_llm(choice)
     memory_store = MemPalaceStore()
 
+    if wing_override:
+        try:
+            memory_store.set_active_wing(wing_override)
+        except ValueError as e:
+            print(f"[warning] invalid --wing value: {e}")
+
     registry = build_registry()
     registry.register(Spawn(parent_registry=registry, llm=llm, memory_store=memory_store))
     registry.register(MemoryRecall(memory_store))
+    registry.register(MemoryRecallHere(memory_store))
+    registry.register(DiaryWrite(memory_store))
+    registry.register(SetWing(memory_store))
 
-    # Inject wake-up recall at session start
+    system_prompt = _build_system_prompt(memory_store)
+
+    # Use wake_up_full at session start: global + wing-scoped diary
     history: list[dict] = []
-    recalled = memory_store.wake_up()
+    recalled = memory_store.wake_up_full()
     if recalled:
         history = [{"role": "system", "content": f"<recalled-memory>{recalled}</recalled-memory>"}]
 
@@ -494,7 +683,8 @@ async def _repl(choice: StartupChoice) -> None:
     print(f"  Model  : {choice.model}")
     print(f"  Critic : {choice.critic_model or '<disabled>'}")
     print(f"  Tools  : {', '.join(registry.names())}")
-    print(f"  Memory : {memory_store._palace_path}")
+    print(f"  Memory : {memory_store.palace_path}")
+    print(f"  Wing   : {memory_store.active_wing}")
     print("  Type your message. /help for slash commands. /exit to quit.")
     print("-" * 60)
 
@@ -521,19 +711,21 @@ async def _repl(choice: StartupChoice) -> None:
             history, _ = await _stream_one_turn(
                 registry, llm, history, user_input,
                 critic_llm=critic_llm, memory_store=memory_store,
+                system_prompt=system_prompt,
             )
         except KeyboardInterrupt:
             print("\n[interrupted]")
             continue
 
 
-def cmd_repl(_args: argparse.Namespace) -> int:
+def cmd_repl(args: argparse.Namespace) -> int:
     _print_banner()
     _print_environment()
     _print_web_search_notice()
     choice = gather_startup_choice()
+    wing_override = _resolve_wing(args)
     try:
-        asyncio.run(_repl(choice))
+        asyncio.run(_repl(choice, wing_override=wing_override))
     except KeyboardInterrupt:
         print("\nbye.")
     return 0
@@ -571,14 +763,30 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     from .memory import MemPalaceStore
     from .builtin.memory_recall import MemoryRecall
+    from .builtin.memory_recall_here import MemoryRecallHere
+    from .builtin.diary_write import DiaryWrite
+    from .builtin.set_wing import SetWing
+
     memory_store = MemPalaceStore()
+
+    wing_override = _resolve_wing(args)
+    if wing_override:
+        try:
+            memory_store.set_active_wing(wing_override)
+        except ValueError as e:
+            print(f"[warning] invalid --wing value: {e}", file=sys.stderr)
 
     registry = build_registry()
     registry.register(Spawn(parent_registry=registry, llm=llm, memory_store=memory_store))
     registry.register(MemoryRecall(memory_store))
+    registry.register(MemoryRecallHere(memory_store))
+    registry.register(DiaryWrite(memory_store))
+    registry.register(SetWing(memory_store))
+
+    system_prompt = _build_system_prompt(memory_store)
 
     history: list[dict] = []
-    recalled = memory_store.wake_up()
+    recalled = memory_store.wake_up_full()
     if recalled:
         history = [{"role": "system", "content": f"<recalled-memory>{recalled}</recalled-memory>"}]
 
@@ -586,7 +794,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         _, reason = await _stream_one_turn(
             registry, llm, history, args.prompt,
             critic_llm=critic_llm, quiet_tools=args.quiet,
-            memory_store=memory_store,
+            memory_store=memory_store, system_prompt=system_prompt,
         )
         return reason
 
@@ -698,6 +906,72 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         print(f"  error      : {e}")
 
     print()
+    print("[wings]")
+    try:
+        from .memory.wings import list_wings, read_active_wing, read_intent
+        from .memory.mempalace_store import _DEFAULT_KENT_HOME
+
+        home = _DEFAULT_KENT_HOME
+        active_wing = read_active_wing(home=home)
+        all_wings = list_wings(home=home)
+        cap = 50
+        displayed = all_wings[:cap]
+        overflow = len(all_wings) - cap
+
+        if not all_wings:
+            print("  no wings yet")
+        else:
+            for w in displayed:
+                intent = read_intent(w, home=home)
+                marker = " *" if w == active_wing else "  "
+                intent_part = f" — {intent}" if intent else ""
+                diary_dir = home / "diaries" / w
+                try:
+                    file_count = len(list(diary_dir.glob("*.md")))
+                except OSError:
+                    file_count = 0
+                print(f"{marker} {w}{intent_part}  [{file_count} diary file(s)]")
+            if overflow > 0:
+                print(f"  ({overflow} more...)")
+    except Exception as e:
+        print(f"  error: {e}")
+
+    print()
+    print("[diary]")
+    try:
+        from datetime import datetime
+        from .memory.wings import list_wings, read_active_wing
+        from .memory.mempalace_store import _DEFAULT_KENT_HOME
+
+        home = _DEFAULT_KENT_HOME
+        all_wings = list_wings(home=home)
+
+        if not all_wings:
+            print("  no diary entries yet")
+        else:
+            for w in all_wings:
+                diary_dir = home / "diaries" / w
+                try:
+                    md_files = sorted(diary_dir.glob("*.md"))
+                    total_entries = 0
+                    last_mtime = 0.0
+                    for f in md_files:
+                        total_entries += f.read_text(encoding="utf-8", errors="ignore").count("\n## ")
+                        mtime = f.stat().st_mtime
+                        if mtime > last_mtime:
+                            last_mtime = mtime
+                    last_str = (
+                        datetime.fromtimestamp(last_mtime).isoformat(timespec="seconds")
+                        if last_mtime > 0
+                        else "<never>"
+                    )
+                    print(f"  {w:<20} {total_entries:>4} entries  last-write: {last_str}")
+                except Exception as e:
+                    print(f"  {w:<20} <error: {e}>")
+    except Exception as e:
+        print(f"  error: {e}")
+
+    print()
     print("[deps]")
     for mod in (
         "openai", "httpx", "selectolax", "markdownify",
@@ -718,6 +992,12 @@ def _build_parser() -> argparse.ArgumentParser:
         prog=APP_NAME,
         description="kent — interactive terminal AI agent",
     )
+    parser.add_argument(
+        "--wing",
+        default=None,
+        metavar="NAME",
+        help="Set the active project wing for this session",
+    )
     sub = parser.add_subparsers(dest="command")
 
     # `kent run "<prompt>"`
@@ -726,6 +1006,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--service", default=None, help="Override service id")
     p_run.add_argument("--model", default=None, help="Override model id")
     p_run.add_argument("--quiet", action="store_true", help="Suppress tool-call chatter")
+    p_run.add_argument(
+        "--wing",
+        default=None,
+        metavar="NAME",
+        help="Set the active project wing for this run",
+    )
     p_run.set_defaults(func=cmd_run)
 
     # `kent auth`

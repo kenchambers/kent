@@ -60,7 +60,7 @@ def test_record_turn_writes_one_line_per_message(tmp_path, fake_sweep):
     ]
     store.record_turn(messages, session_id=store.session_id)
 
-    transcript = store._transcript_path
+    transcript = store.transcript_path
     assert transcript.exists()
     lines = [l for l in transcript.read_text().strip().split("\n") if l]
     assert len(lines) == 2
@@ -178,8 +178,8 @@ def test_transcript_path_uses_session_id(tmp_path):
     from agent.memory.mempalace_store import MemPalaceStore
 
     store = MemPalaceStore(palace_path=tmp_path / "palace")
-    assert store.session_id in str(store._transcript_path)
-    assert store._transcript_path.suffix == ".jsonl"
+    assert store.session_id in str(store.transcript_path)
+    assert store.transcript_path.suffix == ".jsonl"
 
 
 def test_sdk_and_cli_share_default_palace(monkeypatch, tmp_path):
@@ -199,8 +199,8 @@ def test_sdk_and_cli_share_default_palace(monkeypatch, tmp_path):
     sdk_store = loop_mod._default_store()
     cli_store = store_mod.MemPalaceStore()  # what cli._repl/cmd_run construct
 
-    assert sdk_store._palace_path == cli_store._palace_path
-    assert sdk_store._palace_path == tmp_path / "kent_home" / "palace"
+    assert sdk_store.palace_path == cli_store.palace_path
+    assert sdk_store.palace_path == tmp_path / "kent_home" / "palace"
 
 
 def test_default_palace_path_is_kent_specific(monkeypatch, tmp_path):
@@ -217,5 +217,186 @@ def test_default_palace_path_is_kent_specific(monkeypatch, tmp_path):
     importlib.reload(mod)
 
     store = mod.MemPalaceStore()
-    assert store._palace_path == tmp_path / "kent_home" / "palace"
-    assert ".mempalace" not in str(store._palace_path)
+    assert store.palace_path == tmp_path / "kent_home" / "palace"
+    assert ".mempalace" not in str(store.palace_path)
+
+
+# --- wing + WingedMemoryStore Protocol coverage ----------------------------- #
+
+def test_active_wing_defaults_to_kent_default(tmp_path):
+    """Fresh kent_home with no active_wing.txt → active_wing == 'kent_default'."""
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    assert store.active_wing == "kent_default"
+
+
+def test_active_wing_reads_from_active_wing_txt(tmp_path):
+    """Pre-existing active_wing.txt → constructor picks it up."""
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "active_wing.txt").write_text("preset-wing")
+
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    assert store.active_wing == "preset-wing"
+
+
+def test_set_active_wing_persists_to_disk(tmp_path):
+    """set_active_wing writes the new name to active_wing.txt."""
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    store.set_active_wing("new-wing")
+
+    assert store.active_wing == "new-wing"
+    assert (tmp_path / "active_wing.txt").read_text() == "new-wing"
+
+
+def test_set_active_wing_rejects_invalid_name(tmp_path):
+    """Invalid wing name → ValueError, active_wing unchanged, file untouched."""
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    original = store.active_wing
+
+    with pytest.raises(ValueError):
+        store.set_active_wing("Invalid Name!")
+
+    assert store.active_wing == original
+    assert not (tmp_path / "active_wing.txt").exists() or (
+        (tmp_path / "active_wing.txt").read_text() != "Invalid Name!"
+    )
+
+
+def test_set_active_wing_lowercases_name(tmp_path):
+    """Uppercase input → stored lowercase (filesystem-safe on macOS APFS)."""
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    store.set_active_wing("MyProject")
+
+    assert store.active_wing == "myproject"
+
+
+def test_kent_home_property_returns_constructor_arg(tmp_path):
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    assert store.kent_home == tmp_path
+
+
+def test_palace_path_property_returns_constructor_arg(tmp_path):
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    palace = tmp_path / "custom-palace"
+    store = MemPalaceStore(palace_path=palace, kent_home=tmp_path)
+    assert store.palace_path == palace
+
+
+def test_mempalace_store_satisfies_winged_protocol(tmp_path):
+    """Structural Protocol check: MemPalaceStore implements WingedMemoryStore.
+
+    Plan: tools that need wing capability do isinstance() / Protocol checks
+    before exposing wing args. This guards the contract.
+    """
+    from agent.memory.mempalace_store import MemPalaceStore
+    from agent.memory.store import MemoryStore, WingedMemoryStore
+
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    assert isinstance(store, MemoryStore)
+    assert isinstance(store, WingedMemoryStore)
+
+
+def test_recall_in_wing_swallows_exceptions(tmp_path, monkeypatch):
+    """recall_in_wing must never raise — backend errors degrade to empty string."""
+    import mempalace.layers
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    class _BrokenL3:
+        def __init__(self, p):
+            pass
+
+        def search(self, *a, **kw):
+            raise RuntimeError("layer3 detonated")
+
+    monkeypatch.setattr(mempalace.layers, "Layer3", _BrokenL3)
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    store.set_active_wing("err-test")
+    assert store.recall_in_wing("anything") == ""
+
+
+def test_wake_up_full_swallows_wing_pass_exceptions(tmp_path, monkeypatch):
+    """If the wing-scoped recall pass fails, wake_up_full must still return the
+    global block — it must not raise or omit global recall."""
+    import mempalace.layers
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    class _PartialBrokenStack:
+        def __init__(self, p):
+            pass
+
+        def wake_up(self):
+            return "GLOBAL_OK"
+
+        def recall(self, *a, **kw):
+            raise RuntimeError("wing recall down")
+
+    monkeypatch.setattr(mempalace.layers, "MemoryStack", _PartialBrokenStack)
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    store.set_active_wing("partial-fail")
+
+    result = store.wake_up_full()
+    assert "GLOBAL_OK" in result
+
+
+def test_wake_up_full_filters_no_drawers_sentinel(tmp_path, monkeypatch):
+    """When the wing pass returns 'No drawers found', it must NOT be appended."""
+    import mempalace.layers
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    class _SentinelStack:
+        def __init__(self, p):
+            pass
+
+        def wake_up(self):
+            return "GLOBAL_BLOCK"
+
+        def recall(self, *, wing, room, n_results):
+            return "No drawers found for that filter."
+
+    monkeypatch.setattr(mempalace.layers, "MemoryStack", _SentinelStack)
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    store.set_active_wing("sentinel-wing")
+
+    result = store.wake_up_full()
+    assert "GLOBAL_BLOCK" in result
+    assert "No drawers found" not in result
+
+
+def test_wake_up_full_concatenates_when_both_have_content(tmp_path, monkeypatch):
+    """Both blocks non-empty → concatenated with blank-line separator."""
+    import mempalace.layers
+    from agent.memory.mempalace_store import MemPalaceStore
+
+    class _DualStack:
+        def __init__(self, p):
+            pass
+
+        def wake_up(self):
+            return "GLOBAL_BLOCK"
+
+        def recall(self, *, wing, room, n_results):
+            assert wing == "dual-wing"
+            assert room == "daily"
+            return "WING_BLOCK"
+
+    monkeypatch.setattr(mempalace.layers, "MemoryStack", _DualStack)
+    store = MemPalaceStore(palace_path=tmp_path / "palace", kent_home=tmp_path)
+    store.set_active_wing("dual-wing")
+
+    result = store.wake_up_full()
+    assert "GLOBAL_BLOCK" in result
+    assert "WING_BLOCK" in result
+    # Separator between blocks
+    assert "GLOBAL_BLOCK\n\nWING_BLOCK" in result
