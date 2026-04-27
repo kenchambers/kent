@@ -7,6 +7,7 @@ from ..loop import run as agent_run
 
 if TYPE_CHECKING:
     from ..llm import LLM
+    from ..memory.store import MemoryStore
 
 SUBAGENT_SYSTEM_PROMPT = (
     "You are a focused subagent. Complete the given task precisely and concisely. "
@@ -33,9 +34,15 @@ class Spawn:
     )
     input_model = SpawnArgs
 
-    def __init__(self, parent_registry: ToolRegistry, llm: "LLM"):
+    def __init__(
+        self,
+        parent_registry: ToolRegistry,
+        llm: "LLM",
+        memory_store: "MemoryStore | None" = None,
+    ):
         self.parent_registry = parent_registry
         self.llm = llm
+        self.memory_store = memory_store
 
     def is_concurrency_safe(self, args: SpawnArgs) -> bool:
         return True  # subagents parallelize
@@ -64,6 +71,7 @@ class Spawn:
             system=SUBAGENT_SYSTEM_PROMPT,
             max_turns=10,
             signal=ctx.signal,
+            memory_store=self.memory_store,
         ):
             if isinstance(ev, AssistantMessageComplete):
                 final_text = [ev.message.content] if ev.message.content else []
