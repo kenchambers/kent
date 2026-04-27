@@ -345,6 +345,138 @@ uv run pytest tests/integration/     # live: requires OLLAMA_HOST or similar
 
 The offline suite covers the agent loop, the streaming executor, compaction, the `Spawn` subagent, and every built-in tool (DDG redirect unwrap, URL validation, html→md conversion, output truncation, shell detection / run / abort / timeout). 71 tests at last count, all green.
 
+## Persistent memory
+
+Kent has long-term, cross-session memory **on by default**. It's powered by [MemPalace](https://github.com/MemPalace/mempalace), a local-first, ChromaDB-backed store that requires no API key and runs entirely on your machine.
+
+There is nothing to enable. The first time you launch `kent`, `kent run`, or call `agent.run(...)` from your own code, a palace is created at `~/.kent/palace` and every conversation turn from that point on is persisted. The next session — same machine, hours or weeks later — recalls relevant context automatically.
+
+Kent owns its own ChromaDB palace at `~/.kent/palace` (configurable via `$KENT_HOME`). It does **not** share the default mempalace location at `~/.mempalace/palace`, so kent's verbatim conversations stay isolated from other mempalace consumers (`mempalace mine`, the MCP server, etc.) on the same machine.
+
+### Default-on behavior
+
+| Entry point | Memory behavior |
+|---|---|
+| `kent` (REPL) | Constructs `MemPalaceStore()`, injects wake-up at session start, registers the `memory_recall` tool, records every turn |
+| `kent run "<prompt>"` | Same as REPL, just one-shot |
+| `agent.run(messages=..., tools=..., llm=...)` (library) | Lazily constructs a default `MemPalaceStore` if `memory_store=None` and threads it through the loop and `maybe_compact` |
+| Tests | `tests/conftest.py` autouse fixture monkey-patches `_default_store` to a private `NullMemoryStore` so unit tests stay offline |
+
+To **opt out** as a library consumer, pass any object implementing the 3-method `MemoryStore` protocol — for example, a no-op stub:
+
+```python
+class NullStore:
+    @property
+    def session_id(self): return "no-memory"
+    def record_turn(self, messages, *, session_id): pass
+    def wake_up(self): return ""
+    def recall(self, query, k=5): return ""
+
+async for ev in run(messages=[...], tools=registry, llm=llm, memory_store=NullStore()):
+    ...
+```
+
+### What we use from MemPalace
+
+Kent uses a deliberately small surface of mempalace's API. The full library ships 29 MCP tools, a CLI, and four memory layers; we reach into three submodules and ignore the rest.
+
+| MemPalace API | Where kent calls it | Purpose |
+|---|---|---|
+| `mempalace.sweeper.sweep(jsonl_path, palace_path, source_label="kent")` | `MemPalaceStore.record_turn` (every turn) | Ingests the per-session JSONL into ChromaDB at `~/.kent/palace`. Idempotent — drawer IDs are deterministic, so re-sweeping the same file is a no-op. |
+| `mempalace.layers.MemoryStack(palace_path).wake_up()` | Session start (REPL, `kent run`) and inside `maybe_compact` | Returns ~600–900 tokens of L0 (identity) + L1 (essential moments) — short enough to inject into a system message every compaction without bloat |
+| `mempalace.layers.MemoryStack(palace_path).status()` | `kent doctor` `[memory]` block | Reports `total_drawers` for the health check |
+| `mempalace.layers.Layer3(palace_path).search(query, n_results=k)` | `memory_recall` tool, `/recall` slash command | Deep semantic search over all drawers. We use `Layer3.search` rather than `searcher.search` because the latter prints to stdout instead of returning. |
+| `mempalace.sweeper.parse_claude_jsonl(path)` | `tests/test_memory_transcript.py` only | Used to verify that our transcript writer produces JSONL conformant with mempalace's reader |
+
+**Why no `wing` filter?** The plan originally called for `wing="kent"` as an isolation filter, but mempalace's `sweeper.sweep()` does not write a `wing` field to drawer metadata — only `mempalace mine`, `diary_ingest`, and a few other paths set wings. Filtering sweeper-ingested drawers by wing returns nothing. Kent achieves isolation by owning a separate ChromaDB palace (`~/.kent/palace`) instead of sharing `~/.mempalace/palace` with other tools.
+
+What we **don't** use:
+- **L2 (`stack.recall(wing, room)`)** — wing/room scoped retrieval. Sweeper-ingested drawers have no wing metadata, so the filter doesn't apply to our ingest path.
+- **`mempalace.convo_miner.mine_convos`** — batch-import path for an existing corpus of Claude transcripts. Kent streams live, so it goes through `sweep` per turn instead.
+- **The 29 MCP tools** — kent isn't an MCP host; mempalace is used as a Python library, not an MCP server.
+- **Direct ChromaDB writes** — `sweep` handles dedup and the post-1.5.4 hnswlib quirks. We never reach into the chromadb collection ourselves.
+
+### How a turn flows through MemPalace
+
+```
+   user types "remember my favorite color is octarine"
+              │
+              ▼
+   ┌───────────────────────────────────────┐
+   │ agent.run(...) → loop.py turn         │
+   │   model streams; tools run; assistant │
+   │   message + tool results form a turn  │
+   └───────────────────────────────────────┘
+              │  end-of-turn (any terminal: completed, max_turns,
+              │   tool_loop, model_error, context_overflow, aborted)
+              ▼
+   MemPalaceStore.record_turn(messages, session_id=…)
+              │
+              ▼
+   ┌─────────────────────────────────────────────────────┐
+   │ 1. append_messages → JSONL line per message in      │
+   │    Claude-Code format at                            │
+   │    ~/.cache/kent/transcripts/<session_id>.jsonl     │
+   │    • role: user / assistant / tool_use / tool_result│
+   │    • sessionId, uuid, timestamp, content            │
+   └─────────────────────────────────────────────────────┘
+              │
+              ▼
+   ┌─────────────────────────────────────────────────────┐
+   │ 2. mempalace.sweeper.sweep(...)                     │
+   │    • parses JSONL                                   │
+   │    • generates deterministic drawer IDs             │
+   │      `sweep_<session_id>_<message_uuid>`            │
+   │    • upserts into ChromaDB at ~/.kent/palace        │
+   │    • idempotent: re-sweep is a no-op                │
+   └─────────────────────────────────────────────────────┘
+```
+
+On the **read side**, two paths surface stored memory back to the model:
+
+1. **Wake-up injection** (proactive). At session start the REPL/CLI calls `MemoryStack.wake_up()`, wraps the result in `<recalled-memory>…</recalled-memory>`, and prepends it as a system message. When `maybe_compact` fires mid-session, the same wake-up text is embedded inline in the new summary message — so the priming refreshes after every compaction instead of being lost when the head is summarized away.
+
+2. **`memory_recall` tool** (on-demand). The model can call `memory_recall(query, k=5)` whenever a question references prior context. This routes to `Layer3.search`, which does semantic vector search over all drawers and returns formatted text the model can quote back.
+
+The two paths are complementary: wake-up gives the model passive priming with the most "essential" L1 moments; `memory_recall` gives it active retrieval for specific queries that wake-up didn't surface.
+
+### Crash safety and error handling
+
+- **Recording fires on every terminal reason.** The loop calls `record_turn` on `completed`, `next_turn`, `model_error`, `max_turns`, `tool_loop`, `aborted`, and `context_overflow`. A crashed turn is captured up to the last completed message, not lost.
+- **Backend errors never break a conversation.** All three `MemPalaceStore` methods (`record_turn`, `wake_up`, `recall`) are wrapped in `try/except` with `logging.warning`. A broken palace, a chromadb upgrade glitch, or a corrupt drawer surfaces as a warning in the log; the loop carries on.
+- **JSONL is a write buffer, not the source of truth.** Per-session JSONL files at `~/.cache/kent/transcripts/` are append-only and accumulate. The durable store is the ChromaDB palace. You can wipe the transcript dir at any time without losing memory.
+
+### Slash commands (REPL)
+
+| Command | Description |
+|---|---|
+| `/memory` | Show palace path, transcript path, and current session ID |
+| `/recall <query>` | Run `Layer3.search` and print the raw results |
+| `/forget` | Delete the **current session's** transcript file (with confirmation). Note: long-term palace drawers persist — this only clears the un-swept buffer. |
+
+### Health check
+
+`kent doctor` includes a `[memory]` block:
+
+```
+[memory]
+  palace     : /Users/you/.kent/palace  (exists: True)
+  transcripts: /Users/you/.cache/kent/transcripts  (exists: True)
+  drawers    : 1247
+  last-write : 2026-04-27T09:04:22
+```
+
+`drawers` comes from `MemoryStack.status()`; `last-write` is the most recent mtime among palace files. Both are `0` / `<never>` until the first turn is recorded.
+
+### Caveats
+
+- **Secrets are stored verbatim.** Anything echoed in a conversation — API keys leaked through `shell` output, `.env` contents read by a tool, password fragments — ends up in the palace as searchable text. `/forget` removes the current session's JSONL buffer, but already-swept drawers persist; use mempalace's own tools to clear them, or `rm -rf ~/.kent/palace` to wipe everything.
+- **First import is heavy.** MemPalace pulls in chromadb (~300 MB) and downloads a ~80 MB ONNX model on first use for embeddings. Kent lazy-imports mempalace inside `MemPalaceStore.__init__`, so `import agent` itself stays light — the cost is paid on first `record_turn` / `wake_up` call.
+- **Subagents share the parent's store.** When `kent` spawns a subagent via `spawn_subagent`, it threads the same `MemPalaceStore` through. Concurrent sibling-spawn writes are unverified — see Known limitations.
+- **No per-project scoping.** Kent uses one palace at `~/.kent/palace` for everything. If you want per-project isolation today, set `$KENT_HOME` to a project-specific directory before launching.
+
+---
+
 ## Known limitations
 
 - No built-in retries or rate limiting — wrap `run()` yourself if needed.
@@ -352,3 +484,5 @@ The offline suite covers the agent loop, the streaming executor, compaction, the
 - No Anthropic-native API — use a litellm proxy or `OpenAICompatibleLLM` with an OpenAI-format endpoint.
 - No live integration tests in CI — run `tests/integration/` manually with `OLLAMA_HOST` set.
 - DuckDuckGo HTML can rate-limit aggressive use; `web_search` is best-effort scraping, not a contracted API.
+- **Concurrent subagent memory writes are unverified.** When a `Spawn`-ed subagent shares the parent's `MemPalaceStore`, sibling subagents writing to the same JSONL transcript and ChromaDB upsert path concurrently may race. Safe today because subagents typically serialize their own LLM calls; revisit if you parallelize many spawns.
+- **Transcript buffer grows unbounded.** Per-session JSONL files under `~/.cache/kent/transcripts/` are never pruned. They are a write buffer; the durable store is ChromaDB. Sweep / delete the directory yourself if it grows large.
