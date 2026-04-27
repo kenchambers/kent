@@ -29,6 +29,7 @@ from .builtin.shell import Shell, detect_shell_backend
 from .builtin.spawn import Spawn
 from .builtin.web_fetch import WebFetch
 from .builtin.web_search import WebSearch
+from .critic import critique
 from .events import (
     AssistantMessageComplete,
     ModelError,
@@ -37,7 +38,7 @@ from .events import (
     ToolCallComplete,
     ToolResult,
 )
-from .llm import OpenAICompatibleLLM
+from .llm import LLM, OpenAICompatibleLLM
 from .loop import run
 from .tools import ToolRegistry
 
@@ -77,6 +78,7 @@ class StartupChoice:
     model: str
     api_key: str
     context_window: int
+    critic_model: str | None = None  # None = critic disabled
 
 
 def _ensure_config_dir() -> None:
@@ -210,8 +212,31 @@ def gather_startup_choice(*, save: bool = True) -> StartupChoice:
         print(f"  ! No API key entered and {env_key} is unset. Aborting.")
         sys.exit(2)
 
+    print()
+    print("[critic — second-pass review (optional)]")
+    print("  A separate LLM re-checks each answer for accuracy/completeness.")
+    print("  Helps non-reasoning models; redundant for o1/R1/extended-thinking.")
+    print("  Roughly doubles per-turn cost.")
+    prev_enabled = bool(cfg.get("critic_model"))
+    enable_critic = _prompt_choice(
+        "Enable critic",
+        ["yes", "no"],
+        default="yes" if prev_enabled else "no",
+    ) == "yes"
+    critic_model: str | None = None
+    if enable_critic:
+        critic_model = _prompt_choice(
+            "Critic model",
+            service["models"],
+            default=cfg.get("critic_model") or model,
+        )
+
     if save:
-        save_config({"service_id": service_id, "model": model})
+        save_config({
+            "service_id": service_id,
+            "model": model,
+            "critic_model": critic_model,
+        })
 
     return StartupChoice(
         service_id=service_id,
@@ -220,6 +245,7 @@ def gather_startup_choice(*, save: bool = True) -> StartupChoice:
         model=model,
         api_key=api_key,
         context_window=service["default_context_window"],
+        critic_model=critic_model,
     )
 
 
@@ -242,7 +268,18 @@ def _make_llm(choice: StartupChoice) -> OpenAICompatibleLLM:
     )
 
 
-async def _stream_one_turn(
+def _make_critic_llm(choice: StartupChoice) -> OpenAICompatibleLLM | None:
+    if not choice.critic_model:
+        return None
+    return OpenAICompatibleLLM(
+        base_url=choice.base_url,
+        api_key=choice.api_key,
+        model=choice.critic_model,
+        context_window=choice.context_window,
+    )
+
+
+async def _run_once(
     registry: ToolRegistry,
     llm: OpenAICompatibleLLM,
     history: list[dict],
@@ -250,7 +287,7 @@ async def _stream_one_turn(
     *,
     quiet_tools: bool = False,
 ) -> tuple[list[dict], str]:
-    """Returns (new_history, terminal_reason)."""
+    """Single agent turn. Returns (new_history, terminal_reason)."""
     history = [*history, {"role": "user", "content": user_input}]
     new_messages: list[dict] = []
     terminal_reason = "completed"
@@ -281,6 +318,41 @@ async def _stream_one_turn(
                 print(f"\n[terminal: {ev.reason}]")
     print()
     return [*history, *new_messages], terminal_reason
+
+
+async def _stream_one_turn(
+    registry: ToolRegistry,
+    llm: OpenAICompatibleLLM,
+    history: list[dict],
+    user_input: str,
+    *,
+    critic_llm: LLM | None = None,
+    quiet_tools: bool = False,
+) -> tuple[list[dict], str]:
+    """
+    Run one turn; if a critic is provided and the turn completed cleanly,
+    run a single critique pass and revise once if issues are flagged.
+    """
+    history, reason = await _run_once(
+        registry, llm, history, user_input, quiet_tools=quiet_tools
+    )
+    if critic_llm is None or reason != "completed":
+        return history, reason
+
+    verdict = await critique(history, critic_llm)
+    if not verdict:
+        return history, reason
+
+    preview = verdict if len(verdict) <= 200 else verdict[:197] + "..."
+    print(f"\n[critic] flagged issues — revising")
+    print(f"  {preview}")
+    injected = (
+        "A reviewer flagged the following issues with your previous answer. "
+        f"Please address them concisely:\n\n{verdict}"
+    )
+    return await _run_once(
+        registry, llm, history, injected, quiet_tools=quiet_tools
+    )
 
 
 # ---------- slash commands ------------------------------------------------- #
@@ -314,6 +386,7 @@ def _handle_slash(
     elif head == "/model":
         print(f"service: {choice.service_label} ({choice.base_url})")
         print(f"model  : {choice.model}")
+        print(f"critic : {choice.critic_model or '<disabled>'}")
         print(f"window : {choice.context_window}")
     elif head == "/clear":
         print("[conversation cleared]")
@@ -327,6 +400,7 @@ def _handle_slash(
 
 async def _repl(choice: StartupChoice) -> None:
     llm = _make_llm(choice)
+    critic_llm = _make_critic_llm(choice)
     registry = build_registry()
     registry.register(Spawn(parent_registry=registry, llm=llm))
 
@@ -334,6 +408,7 @@ async def _repl(choice: StartupChoice) -> None:
     print("[ready]")
     print(f"  Service: {choice.service_label}  ({choice.base_url})")
     print(f"  Model  : {choice.model}")
+    print(f"  Critic : {choice.critic_model or '<disabled>'}")
     print(f"  Tools  : {', '.join(registry.names())}")
     print("  Type your message. /help for slash commands. /exit to quit.")
     print("-" * 60)
@@ -356,7 +431,7 @@ async def _repl(choice: StartupChoice) -> None:
             continue
         try:
             history, _ = await _stream_one_turn(
-                registry, llm, history, user_input
+                registry, llm, history, user_input, critic_llm=critic_llm
             )
         except KeyboardInterrupt:
             print("\n[interrupted]")
@@ -400,14 +475,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         model=model,
         api_key=api_key,
         context_window=service["default_context_window"],
+        critic_model=cfg.get("critic_model"),
     )
     llm = _make_llm(choice)
+    critic_llm = _make_critic_llm(choice)
     registry = build_registry()
     registry.register(Spawn(parent_registry=registry, llm=llm))
 
     async def _go() -> str:
         _, reason = await _stream_one_turn(
-            registry, llm, [], args.prompt, quiet_tools=args.quiet
+            registry, llm, [], args.prompt,
+            critic_llm=critic_llm, quiet_tools=args.quiet,
         )
         return reason
 
@@ -473,6 +551,7 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     cfg = load_config()
     if cfg:
         print(f"  saved choice : service={cfg.get('service_id')}  model={cfg.get('model')}")
+        print(f"  critic       : {cfg.get('critic_model') or '<disabled>'}")
     else:
         print("  saved choice : <none — run `kent` once to set up>")
 

@@ -7,6 +7,7 @@ from .state import LoopState, TerminalReason, TransitionReason, Message
 from .llm import LLM, OpenAICompatibleLLM, ContextOverflowError
 from .tools import Tool, ToolRegistry, ToolContext, CanUseToolFn
 from .compact import maybe_compact
+from .critic import critique
 from .events import (
     TurnStart, TextDelta, ThinkingDelta,
     ToolCall, ToolCallStart, ToolCallDelta, ToolCallComplete,
@@ -25,6 +26,7 @@ __all__ = [
     "LLM", "OpenAICompatibleLLM", "ContextOverflowError",
     "Tool", "ToolRegistry", "ToolContext", "CanUseToolFn",
     "maybe_compact",
+    "critique",
     "TurnStart", "TextDelta", "ThinkingDelta",
     "ToolCall", "ToolCallStart", "ToolCallDelta", "ToolCallComplete",
     "AssistantMessage", "AssistantMessageComplete",
