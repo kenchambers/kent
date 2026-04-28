@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from . import _ui
 from .builtin.shell import Shell, detect_shell_backend
 from .builtin.spawn import Spawn
 from .builtin.web_fetch import WebFetch
@@ -72,11 +73,15 @@ _SYSTEM_PROMPT_BASE = (
     "memory_recall (search long-term memory from previous sessions), "
     "memory_recall_here (search the active project wing's diary), "
     "diary_write (record observations, findings, decisions, patterns), "
-    "set_wing (switch or register a named project context). "
+    "set_wing (switch or register a named project context), "
+    "tunnel_create (draw a persistent labeled edge between two rooms across wings — "
+    "use it when you spot a relationship the sweeper wouldn't catch on its own). "
     "Prefer web_search before web_fetch. Prefer shell over re-implementing with another tool. "
     "Use memory_recall when the user asks about things you might have discussed before. "
     "Use memory_recall_here for project-specific context. "
     "Use diary_write to capture important observations, decisions, or patterns. "
+    "Use tunnel_create when two memories belong together — it makes the connection visible "
+    "in the palace graph and persists across sessions. "
     "Keep responses concise."
 )
 
@@ -203,27 +208,33 @@ def resolve_api_key(service_id: str, *, prompt_if_missing: bool = True) -> str |
 # ---------- banner / printers --------------------------------------------- #
 
 def _print_banner() -> None:
-    print("=" * 60)
-    print(f" {APP_NAME} — interactive terminal AI agent")
-    print("=" * 60)
+    line = _ui.c(_ui.GREY, "=" * 60)
+    print(line)
+    print(
+        " "
+        + _ui.style(APP_NAME, _ui.BOLD, _ui.PURPLE)
+        + " "
+        + _ui.c(_ui.DIM, "— interactive terminal AI agent")
+    )
+    print(line)
 
 
 def _print_environment() -> None:
     backend = detect_shell_backend()
     print()
-    print("[environment]")
-    print(f"  OS         : {platform.system()} {platform.release()}")
-    print(f"  Python     : {platform.python_version()}")
-    print(f"  Shell tool : {backend.label}  ({backend.program})")
+    print(_ui.header("environment"))
+    print(_ui.field("OS",         f"{platform.system()} {platform.release()}"))
+    print(_ui.field("Python",     platform.python_version()))
+    print(_ui.field("Shell tool", f"{backend.label}  {_ui.c(_ui.DIM, '(' + backend.program + ')')}"))
 
 
 def _print_web_search_notice() -> None:
     print()
-    print("[web search]")
-    print("  Provider   : DuckDuckGo HTML  (https://html.duckduckgo.com/html/)")
-    print("  API key    : none required")
-    print("  Notes      : DDG may rate-limit; this is best-effort scraping.")
-    print("               No queries are sent to any third-party search API.")
+    print(_ui.header("web search"))
+    print(_ui.field("Provider",   f"DuckDuckGo HTML  {_ui.c(_ui.DIM, '(https://html.duckduckgo.com/html/)')}"))
+    print(_ui.field("API key",    "none required"))
+    print(_ui.field("Notes",      _ui.c(_ui.DIM, "DDG may rate-limit; this is best-effort scraping.")))
+    print(_ui.field("",           _ui.c(_ui.DIM, "No queries are sent to any third-party search API.")))
 
 
 # ---------- prompts -------------------------------------------------------- #
@@ -368,32 +379,54 @@ async def _run_once(
     history = [*history, {"role": "user", "content": user_input}]
     new_messages: list[dict] = []
     terminal_reason = "completed"
-    async for ev in run(
-        messages=history,
-        tools=registry,
-        llm=llm,
-        system=system_prompt,
-        max_turns=15,
-        memory_store=memory_store,
-    ):
-        if isinstance(ev, TextDelta):
-            print(ev.text, end="", flush=True)
-        elif isinstance(ev, ToolCallComplete) and not quiet_tools:
-            args_preview = str(ev.call.arguments)
-            if len(args_preview) > 120:
-                args_preview = args_preview[:117] + "..."
-            print(f"\n  → {ev.call.name}({args_preview})")
-        elif isinstance(ev, ToolResult) and not quiet_tools:
-            tag = "ERR" if ev.is_error else "OK"
-            print(f"  ← [{tag}] {ev.call_id or '<no-id>'}")
-        elif isinstance(ev, AssistantMessageComplete):
-            new_messages.append(ev.message.to_openai_dict())
-        elif isinstance(ev, ModelError):
-            print(f"\n[model error] {type(ev.error).__name__}: {ev.error}")
-        elif isinstance(ev, Terminal):
-            terminal_reason = ev.reason
-            if ev.reason != "completed":
-                print(f"\n[terminal: {ev.reason}]")
+
+    spinner = _ui.Spinner("thinking")
+    spinner.start()
+
+    def _stop_spinner() -> None:
+        spinner.stop()
+
+    try:
+        async for ev in run(
+            messages=history,
+            tools=registry,
+            llm=llm,
+            system=system_prompt,
+            max_turns=15,
+            memory_store=memory_store,
+        ):
+            if isinstance(ev, TextDelta):
+                _stop_spinner()
+                print(ev.text, end="", flush=True)
+            elif isinstance(ev, ToolCallComplete) and not quiet_tools:
+                _stop_spinner()
+                args_preview = str(ev.call.arguments)
+                if len(args_preview) > 120:
+                    args_preview = args_preview[:117] + "..."
+                print()
+                print(_ui.tool_call(ev.call.name, args_preview))
+                # After printing the call, the tool will run; show a per-tool spinner.
+                spinner.start(f"running {ev.call.name}")
+            elif isinstance(ev, ToolResult) and not quiet_tools:
+                _stop_spinner()
+                print(_ui.tool_result(ev.call_id or "<no-id>", ok=not ev.is_error))
+                # After a tool returns, the model thinks again before the next event.
+                spinner.start("thinking")
+            elif isinstance(ev, AssistantMessageComplete):
+                _stop_spinner()
+                new_messages.append(ev.message.to_openai_dict())
+            elif isinstance(ev, ModelError):
+                _stop_spinner()
+                print()
+                print(_ui.error_line("model error", f"{type(ev.error).__name__}: {ev.error}"))
+            elif isinstance(ev, Terminal):
+                _stop_spinner()
+                terminal_reason = ev.reason
+                if ev.reason != "completed":
+                    print()
+                    print(_ui.info_line(f"terminal: {ev.reason}", ""))
+    finally:
+        _stop_spinner()
     print()
     return [*history, *new_messages], terminal_reason
 
@@ -426,8 +459,7 @@ async def _stream_one_turn(
         return history, reason
 
     preview = verdict if len(verdict) <= 200 else verdict[:197] + "..."
-    print(f"\n[critic] flagged issues — revising")
-    print(f"  {preview}")
+    print(_ui.critic_banner(preview))
     injected = (
         "A reviewer flagged the following issues with your previous answer. "
         f"Please address them concisely:\n\n{verdict}"
@@ -472,7 +504,7 @@ def _handle_slash(
     head = cmd_stripped.lower()
 
     if head in ("/exit", "/quit"):
-        print("bye.")
+        print(_ui.c(_ui.DIM, "bye."))
         return history, True
     if head == "/help":
         print(SLASH_HELP)
@@ -651,6 +683,7 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     from .builtin.memory_recall_here import MemoryRecallHere
     from .builtin.diary_write import DiaryWrite
     from .builtin.set_wing import SetWing
+    from .builtin.tunnel_create import TunnelCreate
 
     llm = _make_llm(choice)
     critic_llm = _make_critic_llm(choice)
@@ -668,6 +701,7 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     registry.register(MemoryRecallHere(memory_store))
     registry.register(DiaryWrite(memory_store))
     registry.register(SetWing(memory_store))
+    registry.register(TunnelCreate())
 
     system_prompt = _build_system_prompt(memory_store)
 
@@ -678,21 +712,21 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
         history = [{"role": "system", "content": f"<recalled-memory>{recalled}</recalled-memory>"}]
 
     print()
-    print("[ready]")
-    print(f"  Service: {choice.service_label}  ({choice.base_url})")
-    print(f"  Model  : {choice.model}")
-    print(f"  Critic : {choice.critic_model or '<disabled>'}")
-    print(f"  Tools  : {', '.join(registry.names())}")
-    print(f"  Memory : {memory_store.palace_path}")
-    print(f"  Wing   : {memory_store.active_wing}")
-    print("  Type your message. /help for slash commands. /exit to quit.")
-    print("-" * 60)
+    print(_ui.header("ready"))
+    print(_ui.field("Service", f"{choice.service_label}  {_ui.c(_ui.DIM, '(' + choice.base_url + ')')}", label_width=7))
+    print(_ui.field("Model",   _ui.c(_ui.INK, choice.model), label_width=7))
+    print(_ui.field("Critic",  _ui.c(_ui.INK, choice.critic_model) if choice.critic_model else _ui.c(_ui.DIM, "<disabled>"), label_width=7))
+    print(_ui.field("Tools",   _ui.c(_ui.CYAN, ", ".join(registry.names())), label_width=7))
+    print(_ui.field("Memory",  _ui.c(_ui.DIM, str(memory_store.palace_path)), label_width=7))
+    print(_ui.field("Wing",    _ui.c(_ui.GOLD, memory_store.active_wing), label_width=7))
+    print("  " + _ui.c(_ui.DIM, "Type your message. /help for slash commands. /exit to quit."))
+    print(_ui.rule())
 
     while True:
         try:
-            user_input = input("\nyou> ").strip()
+            user_input = input("\n" + _ui.prompt()).strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nbye.")
+            print("\n" + _ui.c(_ui.DIM, "bye."))
             return
         if not user_input:
             continue
@@ -714,7 +748,7 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
                 system_prompt=system_prompt,
             )
         except KeyboardInterrupt:
-            print("\n[interrupted]")
+            print("\n" + _ui.info_line("interrupted", ""))
             continue
 
 
@@ -766,6 +800,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     from .builtin.memory_recall_here import MemoryRecallHere
     from .builtin.diary_write import DiaryWrite
     from .builtin.set_wing import SetWing
+    from .builtin.tunnel_create import TunnelCreate
 
     memory_store = MemPalaceStore()
 
@@ -782,6 +817,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     registry.register(MemoryRecallHere(memory_store))
     registry.register(DiaryWrite(memory_store))
     registry.register(SetWing(memory_store))
+    registry.register(TunnelCreate())
 
     system_prompt = _build_system_prompt(memory_store)
 
@@ -1219,6 +1255,43 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- viz ------------------------------------------------------------- #
+
+def cmd_viz(args: argparse.Namespace) -> int:
+    # FIXED (R11): precheck mempalace import. Without this we crash mid-
+    # snapshot with a generic ModuleNotFoundError, not an actionable msg.
+    try:
+        import mempalace.palace_graph  # noqa: F401
+    except ImportError:
+        print("kent viz needs mempalace. install: uv pip install mempalace",
+              file=sys.stderr)
+        return 1
+
+    from .viz import start_server
+    from .viz.chat import ChatSession
+    from .memory.mempalace_store import _DEFAULT_PALACE, _DEFAULT_KENT_HOME
+
+    chat = None
+    if not args.read_only:
+        cfg = load_config()
+        svc_id = cfg.get("service_id") or next(iter(SUPPORTED_SERVICES))
+        svc = SUPPORTED_SERVICES.get(svc_id, next(iter(SUPPORTED_SERVICES.values())))
+        model = cfg.get("model") or svc["default_model"]
+        api_key = resolve_api_key(svc_id, prompt_if_missing=False) or ""
+        if not api_key:
+            print("no API key configured. run `kent auth` or pass --read-only.",
+                  file=sys.stderr)
+            return 2
+        llm = OpenAICompatibleLLM(base_url=svc["base_url"], api_key=api_key, model=model)
+        chat = ChatSession(llm=llm, palace=_DEFAULT_PALACE, kent_home=_DEFAULT_KENT_HOME)
+
+    mode = "chat+graph" if chat else "graph (read-only)"
+    print(f"kent viz [{mode}] → http://127.0.0.1:{args.port}")
+    start_server(_DEFAULT_PALACE, _DEFAULT_KENT_HOME,
+                 port=args.port, chat_session=chat)
+    return 0
+
+
 # ---------- argparse ------------------------------------------------------- #
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1333,6 +1406,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # `kent doctor`
     p_doctor = sub.add_parser("doctor", help="Show environment / config / dependency health")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    # `kent viz [--port N] [--read-only]`
+    p_viz = sub.add_parser("viz", help="Open the live 3D palace viewer + chat")
+    p_viz.add_argument("--port", type=int, default=8765)
+    p_viz.add_argument("--read-only", action="store_true",
+                       help="disable the chat panel; just render the palace")
+    p_viz.set_defaults(func=cmd_viz)
 
     return parser
 
