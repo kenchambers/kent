@@ -6,6 +6,7 @@ from .memory_recall import MemoryRecall
 from .memory_recall_here import MemoryRecallHere
 from .diary_write import DiaryWrite
 from .set_wing import SetWing
+from .task_boundary import TaskStart, TaskEnd
 
 __all__ = [
     "Spawn",
@@ -18,4 +19,6 @@ __all__ = [
     "MemoryRecallHere",
     "DiaryWrite",
     "SetWing",
+    "TaskStart",
+    "TaskEnd",
 ]
