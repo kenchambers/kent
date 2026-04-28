@@ -849,6 +849,240 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train(args: argparse.Namespace) -> int:
+    """Run APO training for one resource across configured swap pairs."""
+    import asyncio
+    from .training import TrainingConfig
+    from .training.apo_runner import train_resource, RESOURCE_BASELINES
+    from .training.swap_pair import sweep_pairs
+    from .training.datasets import load_examples_dir, TrainingExample
+    from .training.rollout import set_active_config
+    from .training.eval_harness import run_collusion_probes
+
+    apo_base_url = getattr(args, "apo_base_url", None)
+    gradient_model = getattr(args, "gradient_model", None) or "gpt-5-mini"
+    apply_edit_model = getattr(args, "apply_edit_model", None) or "gpt-4.1-mini"
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if apo_base_url:
+        # Routing APO at a non-OpenAI endpoint — reuse the actor service's key.
+        cfg_for_apo = load_config()
+        svc_id_for_apo = cfg_for_apo.get("service_id") or next(iter(SUPPORTED_SERVICES))
+        openai_key = resolve_api_key(svc_id_for_apo, prompt_if_missing=False) or openai_key
+        if not openai_key:
+            print(
+                f"--apo-base-url set but no api key found in env or saved credentials for {svc_id_for_apo!r}",
+                file=sys.stderr,
+            )
+            return 2
+    elif not openai_key:
+        print("OPENAI_API_KEY not set — APO requires OpenAI for prompt rewriting (or pass --apo-base-url to use an OpenAI-compatible endpoint)", file=sys.stderr)
+        return 2
+
+    resource = args.resource
+    if resource not in RESOURCE_BASELINES:
+        print(f"unknown resource: {resource!r}", file=sys.stderr)
+        print(f"valid: {', '.join(RESOURCE_BASELINES)}", file=sys.stderr)
+        return 2
+
+    if getattr(args, "sweep", False):
+        pairs = list(sweep_pairs())
+        if not pairs:
+            print("no swap pairs defined in ~/.kent/swap_pairs.toml", file=sys.stderr)
+            return 2
+    else:
+        pair_str = getattr(args, "pair", None)
+        if not pair_str or "+" not in pair_str:
+            print("--pair required: format actor_model+critic_model", file=sys.stderr)
+            return 2
+        actor_model, critic_model = pair_str.split("+", 1)
+        cfg_base = load_config()
+        svc_id = cfg_base.get("service_id") or next(iter(SUPPORTED_SERVICES))
+        svc = SUPPORTED_SERVICES.get(svc_id, next(iter(SUPPORTED_SERVICES.values())))
+        api_key = resolve_api_key(svc_id, prompt_if_missing=False) or ""
+        from .training.swap_pair import SwapPair
+        pairs = [SwapPair(
+            actor_base_url=svc["base_url"], actor_api_key=api_key,
+            actor_model=actor_model, actor_family=svc_id,
+            critic_base_url=svc["base_url"], critic_api_key=api_key,
+            critic_model=critic_model, critic_family=f"{svc_id}-critic",
+        )]
+
+    train_size = getattr(args, "train_size", 10)
+    n_rounds = getattr(args, "rounds", 1)
+    n_runners = getattr(args, "runners", 2)
+    examples_dir = getattr(args, "examples_dir", None)
+    skip_collusion = getattr(args, "skip_collusion_check", False)
+
+    if examples_dir:
+        dir_path = Path(examples_dir).expanduser()
+        if not dir_path.exists():
+            print(f"examples dir not found: {dir_path}", file=sys.stderr)
+            return 2
+        examples = load_examples_dir(dir_path)
+        if not examples:
+            print(f"no .jsonl examples found in {dir_path}", file=sys.stderr)
+            return 2
+        if len(examples) > train_size:
+            examples = examples[:train_size]
+    else:
+        # Plan v1 ships without bundled real-task data; fall back to synthetic prompts
+        # but make the limitation visible so it's not silently used in production.
+        print(
+            "[warning] --examples-dir not provided; using synthetic prompts. "
+            "Train on real examples for meaningful APO signal.",
+            file=sys.stderr,
+        )
+        examples = [
+            TrainingExample(task_id=f"ex{i}", prompt=f"Task {i}: what do you remember?")
+            for i in range(train_size)
+        ]
+
+    val_split = max(1, len(examples) // 5)
+    train_examples = [{"task_id": ex.task_id, "prompt": ex.prompt} for ex in examples]
+    val_examples = train_examples[:val_split]
+
+    for pair in pairs:
+        config = TrainingConfig(
+            actor_base_url=pair.actor_base_url,
+            actor_api_key=pair.actor_api_key,
+            actor_model=pair.actor_model,
+            actor_family=pair.actor_family,
+            critic_base_url=pair.critic_base_url,
+            critic_api_key=pair.critic_api_key,
+            critic_model=pair.critic_model,
+            critic_family=pair.critic_family,
+            n_runners=n_runners,
+            max_rounds=n_rounds,
+            train_size=train_size,
+            current_resource=resource,
+        )
+
+        if not skip_collusion:
+            critic_llm_for_probe = OpenAICompatibleLLM(
+                base_url=config.critic_base_url,
+                api_key=config.critic_api_key,
+                model=config.critic_model,
+            )
+            probe = asyncio.run(run_collusion_probes(critic_llm_for_probe))
+            if probe.get("colluding"):
+                print(
+                    f"[abort] critic_pass_rate={probe['critic_pass_rate']:.2f} > 1/5 "
+                    f"— pair {pair.actor_model}×{pair.critic_model} appears to collude. "
+                    "Use --skip-collusion-check to override.",
+                    file=sys.stderr,
+                )
+                continue
+
+        set_active_config(config)
+        try:
+            metrics = train_resource(
+                resource_name=resource,
+                train_dataset=train_examples,
+                val_dataset=val_examples,
+                store_path=config.lightning_store,
+                n_rounds=n_rounds,
+                n_runners=n_runners,
+                openai_api_key=openai_key,
+                apo_base_url=apo_base_url,
+                gradient_model=gradient_model,
+                apply_edit_model=apply_edit_model,
+            )
+        finally:
+            set_active_config(None)
+
+        print(
+            f"[{pair.actor_model}×{pair.critic_model}] "
+            f"val_reward={metrics['val_reward']:.3f}  "
+            f"saved to {metrics['output_path']}"
+        )
+
+    return 0
+
+
+def cmd_wake_up(args: argparse.Namespace) -> int:
+    """Run recall self-improvement games against the live palace."""
+    import asyncio
+    import time
+    import json
+    from .memory.mempalace_store import MemPalaceStore, _DEFAULT_KENT_HOME, _DEFAULT_PALACE
+
+    cfg = load_config()
+    svc_id = cfg.get("service_id") or next(iter(SUPPORTED_SERVICES))
+    svc = SUPPORTED_SERVICES.get(svc_id, next(iter(SUPPORTED_SERVICES.values())))
+    model = cfg.get("model") or svc["default_model"]
+    api_key = resolve_api_key(svc_id, prompt_if_missing=False) or ""
+
+    from .llm import OpenAICompatibleLLM
+    actor_llm = OpenAICompatibleLLM(base_url=svc["base_url"], api_key=api_key, model=model)
+    critic_llm = actor_llm
+
+    palace_path = _DEFAULT_PALACE
+    kent_home = _DEFAULT_KENT_HOME
+    metrics_dir = kent_home / "lightning_store" / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        duration_s = _parse_duration(getattr(args, "duration", "5m"))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    from .training.recall_games import run_recall_game_a
+    from .training.scope_eval import run_scope_eval
+    from .training.closet_fidelity import run_closet_fidelity
+
+    async def _run_games() -> None:
+        deadline = time.monotonic() + duration_s
+        round_n = 0
+        while time.monotonic() < deadline:
+            round_n += 1
+            print(f"[wake-up] round {round_n}")
+            results: dict = {}
+
+            a = await run_recall_game_a(palace_path, actor_llm)
+            results.update(a)
+
+            b = await run_scope_eval(palace_path, kent_home, critic_llm)
+            results.update(b)
+
+            c = await run_closet_fidelity(palace_path, actor_llm)
+            results.update(c)
+
+            entry = {"ts": time.time(), "round": round_n, **results}
+            with open(metrics_dir / "wake_up.jsonl", "a") as f:
+                f.write(json.dumps(entry) + "\n")
+
+            print(f"  recall_a1={results.get('recall_a1', 0):.3f}  "
+                  f"recall_a2={results.get('recall_a2', 0):.3f}  "
+                  f"scope={results.get('scope_accuracy', 0):.3f}  "
+                  f"closet={results.get('closet_fidelity', 0):.3f}")
+
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(1)
+
+    asyncio.run(_run_games())
+    return 0
+
+
+def _parse_duration(s: str) -> float:
+    """Parse duration strings like '5m', '2h', '30s' into seconds."""
+    s = s.strip()
+    try:
+        if s.endswith("h"):
+            return float(s[:-1]) * 3600
+        if s.endswith("m"):
+            return float(s[:-1]) * 60
+        if s.endswith("s"):
+            return float(s[:-1])
+        return float(s)
+    except ValueError as e:
+        raise ValueError(
+            f"invalid duration {s!r} — expected forms like '30s', '5m', '2h'"
+        ) from e
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     _print_environment()
     _print_web_search_notice()
@@ -1013,6 +1247,69 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Set the active project wing for this run",
     )
     p_run.set_defaults(func=cmd_run)
+
+    # `kent train`
+    p_train = sub.add_parser("train", help="APO training: optimize a prompt resource")
+    p_train.add_argument(
+        "--resource",
+        required=True,
+        help="Resource to optimize (actor_system_prompt, retrieval_policy, ...)",
+    )
+    p_train.add_argument(
+        "--pair",
+        default=None,
+        metavar="ACTOR+CRITIC",
+        help="Model pair: actor_model+critic_model (e.g. gpt-4o-mini+gpt-4o)",
+    )
+    p_train.add_argument("--sweep", action="store_true", help="Run all pairs from swap_pairs.toml")
+    p_train.add_argument("--rounds", type=int, default=1, help="APO rounds (default: 1)")
+    p_train.add_argument("--runners", type=int, default=2, help="Parallel runners (default: 2)")
+    p_train.add_argument("--train-size", type=int, default=10, dest="train_size", help="Training examples (default: 10)")
+    p_train.add_argument(
+        "--examples-dir",
+        default=None,
+        dest="examples_dir",
+        metavar="DIR",
+        help="Directory of *.jsonl files with real training examples (each line: {task_id, prompt, ...})",
+    )
+    p_train.add_argument(
+        "--skip-collusion-check",
+        action="store_true",
+        dest="skip_collusion_check",
+        help="Skip the mandatory collusion probe (NOT recommended; documented as mandatory in plan)",
+    )
+    p_train.add_argument(
+        "--apo-base-url",
+        default=None,
+        dest="apo_base_url",
+        metavar="URL",
+        help="Override OpenAI endpoint for APO (e.g. https://api.atlascloud.ai/v1 to run APO against an OpenAI-compatible alternative)",
+    )
+    p_train.add_argument(
+        "--gradient-model",
+        default=None,
+        dest="gradient_model",
+        metavar="MODEL",
+        help="Model APO uses for textual gradients (default: gpt-5-mini)",
+    )
+    p_train.add_argument(
+        "--apply-edit-model",
+        default=None,
+        dest="apply_edit_model",
+        metavar="MODEL",
+        help="Model APO uses for applying edits (default: gpt-4.1-mini)",
+    )
+    p_train.set_defaults(func=cmd_train)
+
+    # `kent wake-up`
+    p_wake = sub.add_parser("wake-up", help="Run memory recall self-improvement games")
+    p_wake.add_argument(
+        "--duration",
+        default="5m",
+        metavar="DURATION",
+        help="How long to run games (e.g. 5m, 2h, 30s; default: 5m)",
+    )
+    p_wake.set_defaults(func=cmd_wake_up)
 
     # `kent auth`
     p_auth = sub.add_parser("auth", help="Save or clear an API key for a service")
