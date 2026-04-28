@@ -10,6 +10,8 @@ dependencies = [
     "selectolax>=0.3.21",
     "markdownify>=0.11",
     "mempalace>=3.3",
+    "agentlightning>=0.1",
+    "poml>=0.0.8",
 ]
 
 [project.scripts]
@@ -38,4 +40,5 @@ markers = [
     "integration: live-network tests (deselect with -m 'not integration')",
     "memory: tests requiring real MemPalace store (deselect with -m 'not memory')",
     "slow: long-running scale tests (deselect with -m 'not slow')",
+    "live_apo: end-to-end APO training against a real LLM endpoint (select with -m live_apo)",
 ]
