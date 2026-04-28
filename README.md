@@ -30,6 +30,11 @@ The Python package is imported as `agent`; the installed CLI binary is `kent`.
   - [Event reference](#event-reference)
   - [Cancellation](#cancellation)
 - [Testing](#testing)
+- [Training & evaluation](#training--evaluation)
+  - [Commands](#commands)
+  - [Test layout](#test-layout-31-total-in-teststraining)
+  - [What's been verified live](#whats-been-verified-live)
+  - [Suggested next tests](#suggested-next-tests)
 - [Persistent memory](#persistent-memory)
   - [Wings & diary](#wings--diary)
 - [Known limitations](#known-limitations)
@@ -55,13 +60,28 @@ agent/
 ├── state.py           # immutable LoopState, terminal/transition reasons
 ├── events.py          # all event dataclasses (TextDelta, ToolCallComplete, Terminal, …)
 ├── compact.py         # context-window compaction + recovery
-└── builtin/
-    ├── shell.py       # cross-platform shell tool (bash / wsl / powershell)
-    ├── spawn.py       # spawn_subagent: delegate a subtask with its own context window
-    ├── web_search.py  # DuckDuckGo HTML scraping (no API key)
-    └── web_fetch.py   # URL → markdown via httpx + markdownify
+├── builtin/
+│   ├── shell.py       # cross-platform shell tool (bash / wsl / powershell)
+│   ├── spawn.py       # spawn_subagent: delegate a subtask with its own context window
+│   ├── web_search.py  # DuckDuckGo HTML scraping (no API key)
+│   ├── web_fetch.py   # URL → markdown via httpx + markdownify
+│   ├── memory_recall.py / memory_recall_here.py / diary_write.py / set_wing.py
+│   └── task_boundary.py  # task_start, task_end (rollout boundaries for training)
+└── training/          # APO training subsystem (Microsoft Agent Lightning + MemPalace)
+    ├── rollout.py            # @agl.rollout-decorated kent_task_rollout + recall_game_rollout
+    ├── apo_runner.py         # train_resource() — wraps agl.Trainer.fit() with APO
+    ├── palace_isolation.py   # snapshot/cleanup helpers (hardlink + SQLite/diary copy)
+    ├── critic_scorer.py      # critic LLM call + JSON parse + scalar reward
+    ├── swap_pair.py          # actor×critic family-collision guard
+    ├── recall_games.py       # Game A: query → Layer3.search → recall@k
+    ├── scope_eval.py         # Game B: counterfactual scope selection
+    ├── closet_fidelity.py    # Game C: can actor answer from closet alone?
+    ├── tunnel_utility.py     # Game D logger
+    ├── eval_harness.py       # collusion probes + cross-critic consensus
+    └── datasets.py           # TrainingExample loaders
 
 tests/                 # pytest suite (offline + opt-in integration tests)
+└── training/          # 31 tests for the training subsystem (see Training & evaluation §)
 ```
 
 ## Install
@@ -357,12 +377,75 @@ async for ev in run(..., signal=signal):
 ## Testing
 
 ```bash
-uv run pytest -m "not integration"   # offline suite (default)
-uv run pytest                        # everything (skips integration unless flagged)
-uv run pytest tests/integration/     # live: requires OLLAMA_HOST or similar
+uv run pytest -m "not integration and not memory and not slow"   # offline suite (default)
+uv run pytest tests/training/                                    # training subsystem only
+uv run pytest -m live_apo -v -s                                  # live LLM + APO tests (Atlas Cloud key required)
+uv run pytest tests/integration/                                 # live mempalace / ollama
 ```
 
-The offline suite covers the agent loop, the streaming executor, compaction, the `Spawn` subagent, and every built-in tool (DDG redirect unwrap, URL validation, html→md conversion, output truncation, shell detection / run / abort / timeout). 71 tests at last count, all green.
+The offline suite covers the agent loop, streaming executor, compaction, the `Spawn` subagent, every built-in tool, and the full training subsystem (palace isolation, critic scoring, swap-pair guard, recall games, rollout pipeline). **196 tests, all green** in ~2.3s.
+
+| Suite | Marker | Count | Wall time |
+|---|---|---|---|
+| Core unit | `not integration and not memory and not slow` | 196 | 2.3s |
+| Training subset | `tests/training/ and not integration and not live_apo` | 25 | 1.7s |
+| Live LLM | `live_apo` | 3 | varies (10s – 10min+) |
+| Live mempalace / ollama | `integration` | 53 (5 currently failing — opt-in) | minutes |
+
+## Training & evaluation
+
+The training subsystem optimizes kent's prompt resources via Microsoft Agent Lightning's APO (Automatic Prompt Optimization) — see [the plan](plans/lets-assume-that-we-happy-sunrise.md). Two CLI entry points and a tiered test ladder validate it.
+
+### Commands
+
+```bash
+kent train --resource query_rewrite_policy \
+    --pair qwen/qwen3.6-35b-a3b+qwen/qwen3.6-35b-a3b \
+    --apo-base-url https://api.atlascloud.ai/v1 \
+    --gradient-model qwen/qwen3.6-35b-a3b \
+    --apply-edit-model qwen/qwen3.6-35b-a3b \
+    --rounds 1 --runners 1 --train-size 3 \
+    --skip-collusion-check          # only when actor and critic share a family
+
+kent wake-up --duration 5m          # run recall self-improvement games against the live palace
+```
+
+`--examples-dir DIR` loads real training examples (one JSONL per file, line shape `{task_id, prompt, ...}`). Without it, synthetic prompts are used (smoke-test only).
+
+### Test layout (31 total, in `tests/training/`)
+
+| File | Tests | What it proves |
+|---|---|---|
+| `test_palace_isolation.py` | 7 | Snapshot/cleanup, SQLite copy branch, diary copy branch (no hardlinks), parallel rollout safety |
+| `test_critic_scorer.py` | 8 | JSON parse, code-fence regex, score clamping to [0,1], scalar-reward weights |
+| `test_swap_pair.py` | 5 | Family-collision rejection, cross-product sweep |
+| `test_recall_games.py` | 3 | Game A logic against a mocked palace (mempalace API has drifted; covers code path only) |
+| `test_rollout.py` | 3 (`integration`) | Rollout end-to-end with FakeLLM; transcript collection regression test for issue #1 |
+| `test_apo_e2e.py` | 2 (`live_apo`) | Single rollout against Atlas Qwen; full APO round on `query_rewrite_policy` via Game-A rollouts |
+| `test_training_efficacy.py` | 2 (`memory` + `live_apo`) | Embedding similarity responds to query quality; directive-vs-baseline policy A/B against Atlas |
+
+### What's been verified live
+
+| Test | Status | Wall time | Result |
+|---|---|---|---|
+| `test_recall_metric_responds_to_query_quality` | ✅ green | 1.6s | drawer-aware queries scored avg sim 0.323 vs 0.027 for unrelated; 3/3 pairwise wins |
+| `test_rollout_e2e_atlas` | ✅ green | 14.4s | Qwen called `memory_recall`, critic scored 1.000, scratch palace cleaned up |
+| `test_apo_train_query_rewrite_policy_atlas` | ⚠️ partial | ~10 min then hangs in shutdown | Round 01 completes (v0=0.866 wins, 4 rollouts at 9-13s each, APO produced edited candidate v1=0.778). Algorithm phase works; AgentOps/SharedMemoryStrategy shutdown hang is upstream. |
+| `test_retrieval_policy_ab_against_atlas` | ⏸ wired, not yet run | est. ~3 min | n/a |
+
+### Suggested next tests
+
+The current ladder validates pipeline plumbing and the *training signal* (better queries → better embedding scores). What's not yet proven: that **APO discovers** better prompts, and that the other plan resources (`scope_policy`, `closet_summary_policy`, `actor_system_prompt`) train cleanly. Order by value/effort:
+
+1. **Sequential resource freezing test** (unit, fast). Save a fake optimized `actor_system_prompt.txt` to `lightning_store/resources/`, run a rollout for `retrieval_policy`, assert the frozen actor prompt is concatenated into the system prompt. Exercises plan line 47 directly.
+2. **Collusion probe trip-wire** (unit, fast). Mock a critic that scores 5/5 on bad outputs; assert `cmd_train` aborts with the right exit code. Plan line 138 calls it "mandatory" — currently only validated by the eval_harness unit test, not the cmd_train wiring.
+3. **Game B scope_eval live test** (`live_apo`, ~3 min). Replay queries at three scopes, assert the critic-picked scope matches the seeded wing. Plan line 26.
+4. **Game C closet_fidelity live test** (`live_apo`, ~3 min). Sample a closet, generate question, assert actor can answer from closet alone. Plan line 27. Stratify by drawer source (`transcript` vs `diary`).
+5. **Multi-round APO improvement test** (`live_apo`, slow). Run APO with `n_rounds=3` on `query_rewrite_policy` and assert val_reward at round 3 ≥ val_reward at round 1. The first concrete claim that APO actually improves the prompt — currently only ran round 01.
+6. **Trained-vs-baseline efficacy** (`live_apo`, slow). Run rollouts with the saved optimized prompt vs the seed, count drawer-content hits in the actor's response. Plan verification step 4.
+7. **APO shutdown-hang fix or workaround**. Either a documented `os._exit(0)` after assertions in slow tests, or upstream issue against agentlightning/agentops. Currently blocks CI on `test_apo_train_query_rewrite_policy_atlas`.
+8. **Concurrent-rollout stress test** (slow). 10 parallel `kent_task_rollout` calls against the same palace; assert no SQLite or diary corruption. Plan critical risk #4 says n_runners=4 multiplies race risk; we have one tiny test for two parallel rollouts but nothing at scale.
+9. **Wing-scoped recall A/B**. Same shape as `test_retrieval_policy_ab_against_atlas` but using `memory_recall_here` to test that wing routing actually narrows results.
 
 ## Persistent memory
 
