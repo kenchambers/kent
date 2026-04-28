@@ -9,13 +9,16 @@ The Python package is imported as `agent`; the installed CLI binary is `kent`.
 - [What this is](#what-this-is)
 - [Repo layout](#repo-layout)
 - [Install](#install)
+- [Quick start (dev)](#quick-start-dev)
 - [Getting started](#getting-started)
   - [1. Set your API key](#1-set-your-api-key)
   - [2. Launch the REPL](#2-launch-the-repl)
   - [3. One-shot mode](#3-one-shot-mode)
+  - [4. Open the live 3D palace viewer + chat](#4-open-the-live-3d-palace-viewer--chat)
 - [CLI reference](#cli-reference)
   - [`kent`](#kent-1)
   - [`kent run`](#kent-run)
+  - [`kent viz`](#kent-viz)
   - [`kent auth`](#kent-auth)
   - [`kent models`](#kent-models)
   - [`kent doctor`](#kent-doctor)
@@ -102,6 +105,31 @@ uv sync
 
 This installs the `kent` binary into the project venv. Either run it via `uv run kent …` or activate the venv (`source .venv/bin/activate`) and use `kent` directly.
 
+## Quick start (dev)
+
+The repo ships a one-shot bootstrap script that installs dependencies, validates your API keys, and drops you into a chat session:
+
+```bash
+./dev-startup.sh
+```
+
+What it does:
+
+1. Runs `uv sync` to install all project + dev dependencies into `.venv`.
+2. Reads `credentials.json` at the repo root and filters out placeholder values (anything containing `<`, e.g. `apikey-<your-atlascloud-key-here>`).
+3. Merges valid keys into `~/.kent/credentials.json` (chmod 0600) — the location `kent` resolves keys from.
+4. Launches `kent run "user just finished installation of kent repo"` so the LLM greets you with post-install context.
+
+Setup before running:
+
+```bash
+cp credentials.json.example credentials.json
+# edit credentials.json and replace the placeholder with your real key
+./dev-startup.sh
+```
+
+If `credentials.json` is missing or only contains placeholder values, the script stops cleanly after `uv sync` and prints `kent auth` instructions instead of launching chat. `credentials.json` is gitignored.
+
 ## Getting started
 
 ### 1. Set your API key
@@ -173,6 +201,28 @@ kent run "Summarize https://peps.python.org/pep-0008/"
 
 Exits 0 on success, 1 on `model_error` / `context_overflow` / `tool_loop`, 2 on missing config.
 
+### 4. Open the live 3D palace viewer + chat
+
+`kent viz` starts a tiny localhost web server that renders your MemPalace as an animated 3D force-directed graph **and** gives you a chat panel so you can talk to kent in the same window. As the agent's tool calls (`diary_write`, `set_wing`, `memory_recall`, …) hit disk, you watch new drawers bloom into the graph in real time.
+
+```bash
+kent viz                       # start on the default port (8765)
+kent viz --port 9000           # pick a different port
+kent viz --read-only           # graph only, no chat panel (no API key needed)
+```
+
+You'll see:
+
+```
+kent viz [chat+graph] → http://127.0.0.1:8765
+```
+
+Open that URL in any modern browser. Ctrl-C in the terminal to stop the server.
+
+The page is one static HTML file with two SSE streams under the hood: `/events` pushes a fresh palace snapshot whenever the on-disk mtime ticks (~1 s), and `POST /chat` streams agent events back into the right-hand chat column. No build step, no npm — `3d-force-graph` and `three.js` load from `cdn.jsdelivr.net` on first paint.
+
+Requirements: `mempalace` must be installed (it is, by default — `uv sync` pulls it in). For the chat panel, `kent auth` (or `ATLASCLOUD_API_KEY`) must be set; pass `--read-only` to skip the LLM/auth setup. The server binds `127.0.0.1` only — there is no auth, by design.
+
 ## CLI reference
 
 ### `kent`
@@ -191,6 +241,21 @@ kent run <prompt> [--service ID] [--model ID] [--quiet]
 | `--service`  | saved or `atlascloud`| Override the service for this call                      |
 | `--model`    | saved or service default | Override the model for this call                    |
 | `--quiet`    | off                  | Suppress the `→ tool(...)` / `← [OK]` chatter           |
+
+### `kent viz`
+
+```
+kent viz [--port N] [--read-only]
+```
+
+Launches the live 3D palace viewer + chat panel on `http://127.0.0.1:<port>`. The graph auto-updates from the on-disk palace via mtime polling; the chat panel runs the same agent stack as `kent` / `kent run` and writes back into the same palace.
+
+| Option         | Default | What it does                                                    |
+|----------------|---------|-----------------------------------------------------------------|
+| `--port`       | `8765`  | Port to bind on `127.0.0.1`                                     |
+| `--read-only`  | off     | Disable the chat panel; render the palace only (no API key needed) |
+
+Exits 0 on Ctrl-C, 1 if `mempalace` isn't importable, 2 if chat is enabled but no API key is configured (run `kent auth` or pass `--read-only`).
 
 ### `kent auth`
 

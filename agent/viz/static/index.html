@@ -1,0 +1,497 @@
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>kent palace</title>
+<style>
+  body{margin:0;background:#000;color:#bbb;font-family:ui-monospace,Menlo,monospace;overflow:hidden}
+  #g{position:fixed;inset:0;z-index:0}
+  #hud{position:fixed;top:8px;left:10px;color:#888;font-size:12px;pointer-events:none;z-index:5;text-shadow:0 1px 2px #000}
+  #err{position:fixed;top:8px;right:10px;color:#f88;font-size:12px;z-index:5;display:none;text-shadow:0 1px 2px #000}
+
+  /* ---------- floating terminal window ---------- */
+  .terminal{
+    position:fixed;
+    top:60px;
+    right:24px;
+    width:460px;
+    height:540px;
+    min-width:280px;
+    min-height:120px;
+    background:rgba(8,10,14,0.62);
+    border:1px solid rgba(120,200,220,0.18);
+    border-radius:7px;
+    box-shadow:0 16px 50px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.04) inset;
+    backdrop-filter:blur(14px) saturate(120%);
+    -webkit-backdrop-filter:blur(14px) saturate(120%);
+    display:flex;
+    flex-direction:column;
+    color:#cfe;
+    z-index:10;
+    overflow:hidden;
+  }
+  .terminal.hidden{display:none}
+  .terminal.minimized{height:30px !important;min-height:30px}
+  .terminal.minimized #log,
+  .terminal.minimized #composer,
+  .terminal.minimized .resize-handle{display:none}
+
+  .terminal-header{
+    display:flex;align-items:center;height:30px;padding:0 10px;
+    background:rgba(255,255,255,0.04);
+    border-bottom:1px solid rgba(120,200,220,0.10);
+    cursor:grab;user-select:none;
+  }
+  .terminal-header.dragging{cursor:grabbing}
+  .traffic{display:flex;gap:7px;align-items:center}
+  .dot{width:11px;height:11px;border-radius:50%;cursor:pointer;
+       box-shadow:0 0 0 1px rgba(0,0,0,0.3) inset}
+  .dot-red{background:#ff5f57}
+  .dot-red:hover{background:#ff8077}
+  .dot-yellow{background:#febc2e}
+  .dot-yellow:hover{background:#fed05a}
+  .dot-green{background:#28c840;cursor:default;opacity:0.55}
+  .terminal-title{
+    flex:1;text-align:center;font-size:11px;color:#7a8;letter-spacing:1px;
+    text-transform:lowercase;
+  }
+  .terminal-title .blink{animation:blink 1s steps(2, end) infinite;color:#5f8}
+  @keyframes blink{50%{opacity:0}}
+
+  #log{
+    flex:1;overflow-y:auto;padding:12px 14px;
+    font-size:12.5px;line-height:1.5;
+    scrollbar-width:thin;scrollbar-color:#345 transparent;
+  }
+  #log::-webkit-scrollbar{width:6px}
+  #log::-webkit-scrollbar-thumb{background:#345;border-radius:3px}
+
+  #log .msg{
+    white-space:pre-wrap;word-wrap:break-word;
+    padding:6px 10px;border-radius:4px;
+    border-left:2px solid transparent;
+    margin-bottom:4px;
+  }
+  #log .row-label{
+    display:block;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;
+    margin-bottom:3px;opacity:0.75;font-weight:600;
+  }
+  /* user — cool blue tone, right-aligned label, left border */
+  #log .user{
+    color:#cfe5ff;background:rgba(80,140,200,0.07);
+    border-left-color:#5cf;
+  }
+  #log .user .row-label{color:#7bf}
+
+  /* assistant — warm green tone, distinct from user */
+  #log .asst{
+    color:#e0fbe8;background:rgba(80,200,140,0.05);
+    border-left-color:#5f8;
+  }
+  #log .asst .row-label{color:#5f8}
+
+  #log .tool{
+    color:#fc8;font-size:11px;font-style:italic;opacity:0.85;
+    border-left-color:transparent;background:transparent;
+    padding:2px 10px;margin-left:8px;
+  }
+  #log .err{
+    color:#fbb;background:rgba(200,80,80,0.08);
+    border-left-color:#f66;
+  }
+  #log .err .row-label{color:#f88}
+  #log .sys{
+    color:#7a8;font-size:11px;opacity:0.7;
+    border-left:0;padding:2px 0;text-align:center;
+    font-style:italic;
+  }
+  /* turn separator */
+  #log .divider{
+    height:1px;
+    background:linear-gradient(to right, transparent, rgba(120,200,220,0.18), transparent);
+    margin:10px 0;border:0;
+  }
+
+  #composer{
+    display:flex;align-items:center;gap:8px;
+    padding:8px 12px;
+    border-top:1px solid rgba(120,200,220,0.10);
+    background:rgba(0,0,0,0.22);
+  }
+  .glyph{color:#5f8;font-weight:bold}
+  #input{
+    flex:1;background:transparent;color:#dfe;
+    border:0;outline:none;font:inherit;
+    caret-color:#5f8;
+  }
+  #input::placeholder{color:#566;opacity:0.7}
+
+  .resize-handle{
+    position:absolute;bottom:0;right:0;width:14px;height:14px;
+    cursor:nwse-resize;opacity:0.5;
+    background:
+      linear-gradient(135deg,
+        transparent 0 55%, #788 55% 60%, transparent 60% 70%,
+        #788 70% 75%, transparent 75% 85%, #788 85% 90%, transparent 90%);
+  }
+
+  /* ---------- floating "show terminal" pill (when window is hidden) ---------- */
+  #show-terminal{
+    position:fixed;bottom:18px;right:18px;z-index:20;
+    background:rgba(8,10,14,0.7);backdrop-filter:blur(8px);
+    color:#cfe;border:1px solid rgba(120,200,220,0.22);
+    border-radius:14px;padding:5px 12px;font:inherit;font-size:12px;
+    cursor:pointer;display:none;
+  }
+  #show-terminal:hover{background:rgba(20,30,40,0.85)}
+</style>
+</head><body>
+
+<div id="g"></div>
+<div id="hud">nodes: <span id="n">…</span> · drawers: <span id="d">…</span> · upd: <span id="u">…</span></div>
+<div id="err"></div>
+
+<div id="chat" class="terminal">
+  <div id="chat-header" class="terminal-header">
+    <div class="traffic">
+      <span class="dot dot-red" data-action="close" title="hide"></span>
+      <span class="dot dot-yellow" data-action="minimize" title="minimize"></span>
+      <span class="dot dot-green"></span>
+    </div>
+    <div class="terminal-title">kent.terminal <span class="blink">▌</span></div>
+    <div style="width:46px"></div>
+  </div>
+  <div id="log"></div>
+  <form id="composer" autocomplete="off">
+    <span class="glyph">›</span>
+    <input id="input" placeholder="talk to kent…"/>
+  </form>
+  <div id="chat-resize" class="resize-handle"></div>
+</div>
+
+<button id="show-terminal" type="button">▸ kent.terminal</button>
+
+<script src="//cdn.jsdelivr.net/npm/3d-force-graph"></script>
+<script>
+// ---------- chat handler (bound FIRST so a later script error can't break it) ----------
+const log = document.getElementById('log');
+
+const LABELS = { user: 'you', asst: 'kent', tool: 'tool', err: 'error' };
+
+function append(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  if (cls in LABELS) {
+    const lbl = document.createElement('span');
+    lbl.className = 'row-label';
+    lbl.textContent = LABELS[cls];
+    d.appendChild(lbl);
+    const body = document.createElement('span');
+    body.className = 'row-body';
+    body.textContent = text;
+    d.appendChild(body);
+    // Cache a reference to the body so streaming appends only mutate text.
+    d._body = body;
+  } else {
+    d.textContent = text;
+  }
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+function divider() {
+  // Don't add consecutive dividers (e.g. on multi-message turns).
+  const last = log.lastElementChild;
+  if (last && last.classList.contains('divider')) return;
+  const hr = document.createElement('div');
+  hr.className = 'divider';
+  log.appendChild(hr);
+}
+
+function appendDelta(node, text) {
+  // Append streaming text to a row's body without re-rendering the label.
+  if (node._body) node._body.textContent += text;
+  else node.textContent += text;
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('composer').onsubmit = async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('input');
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = '';
+  divider();
+  append('user', message);
+
+  let asstLine = null;
+  try {
+    const resp = await fetch('/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message}),
+    });
+    if (!resp.ok) {
+      append('err', 'HTTP ' + resp.status + ' ' + resp.statusText);
+      return;
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        if (!block.startsWith('data: ')) continue;
+        let ev;
+        try { ev = JSON.parse(block.slice(6)); }
+        catch (err) { console.error('bad chat json', err); continue; }
+        if (ev.type === 'TextDelta') {
+          if (!asstLine) asstLine = append('asst', '');
+          appendDelta(asstLine, ev.data.text || '');
+        } else if (ev.type === 'ToolCallComplete') {
+          const argStr = JSON.stringify(ev.data.arguments).slice(0, 80);
+          const tip = document.createElement('div');
+          tip.className = 'msg tool';
+          tip.textContent = '⚙ ' + ev.data.name + '(' + argStr + ')';
+          log.appendChild(tip);
+          log.scrollTop = log.scrollHeight;
+        } else if (ev.type === 'ToolResult') {
+          // Snapshot stream paints the new nodes; nothing to show here.
+        } else if (ev.type === 'AssistantMessageComplete') {
+          asstLine = null;
+        } else if (ev.type === 'ModelError') {
+          append('err', ev.data.error || 'model error');
+        }
+      }
+    }
+  } catch (err) {
+    append('err', err.message);
+  } finally {
+    input.focus();
+  }
+};
+
+// ---------- floating-window: drag, resize, minimize, close ----------
+(function() {
+  const el = document.getElementById('chat');
+  const header = document.getElementById('chat-header');
+  const handle = document.getElementById('chat-resize');
+  const showBtn = document.getElementById('show-terminal');
+  const STORAGE_KEY = 'kent-terminal-rect-v1';
+
+  // Restore saved rect.
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+    if (saved && typeof saved.left === 'number') {
+      el.style.left = saved.left + 'px';
+      el.style.top = saved.top + 'px';
+      el.style.right = 'auto';
+      el.style.width = saved.width + 'px';
+      el.style.height = saved.height + 'px';
+    }
+  } catch (e) { /* fall through to defaults */ }
+
+  function persist() {
+    const r = el.getBoundingClientRect();
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        left: r.left, top: r.top, width: r.width, height: r.height,
+      }));
+    } catch (e) {}
+  }
+
+  // ---- drag (header) ----
+  let drag = null;
+  header.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.dot')) return;  // don't drag from traffic-light buttons
+    const r = el.getBoundingClientRect();
+    drag = { x: e.clientX, y: e.clientY, left: r.left, top: r.top };
+    header.classList.add('dragging');
+    header.setPointerCapture(e.pointerId);
+  });
+  header.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const left = Math.max(0, Math.min(window.innerWidth - 80,
+                                       drag.left + (e.clientX - drag.x)));
+    const top  = Math.max(0, Math.min(window.innerHeight - 30,
+                                       drag.top + (e.clientY - drag.y)));
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+    el.style.right = 'auto';
+  });
+  function endDrag(e) {
+    if (!drag) return;
+    drag = null;
+    header.classList.remove('dragging');
+    persist();
+  }
+  header.addEventListener('pointerup', endDrag);
+  header.addEventListener('pointercancel', endDrag);
+
+  // ---- resize (bottom-right corner) ----
+  let resize = null;
+  handle.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    const r = el.getBoundingClientRect();
+    resize = { x: e.clientX, y: e.clientY, w: r.width, h: r.height };
+    handle.setPointerCapture(e.pointerId);
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (!resize) return;
+    const w = Math.max(280, resize.w + (e.clientX - resize.x));
+    const h = Math.max(160, resize.h + (e.clientY - resize.y));
+    el.style.width = w + 'px';
+    el.style.height = h + 'px';
+  });
+  function endResize() {
+    if (!resize) return;
+    resize = null;
+    persist();
+  }
+  handle.addEventListener('pointerup', endResize);
+  handle.addEventListener('pointercancel', endResize);
+
+  // ---- traffic-light buttons ----
+  document.querySelector('.dot-red').addEventListener('click', () => {
+    el.classList.add('hidden');
+    showBtn.style.display = 'block';
+  });
+  document.querySelector('.dot-yellow').addEventListener('click', () => {
+    el.classList.toggle('minimized');
+  });
+  showBtn.addEventListener('click', () => {
+    el.classList.remove('hidden');
+    showBtn.style.display = 'none';
+    document.getElementById('input').focus();
+  });
+
+  // ---- keyboard: Cmd/Ctrl-` toggles visibility ----
+  window.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === '`') {
+      e.preventDefault();
+      if (el.classList.contains('hidden')) {
+        el.classList.remove('hidden');
+        showBtn.style.display = 'none';
+        document.getElementById('input').focus();
+      } else {
+        el.classList.add('hidden');
+        showBtn.style.display = 'block';
+      }
+    }
+  });
+})();
+
+// ---- read-only probe: hide chat entirely if server has no chat session ----
+fetch('/chat').then(r => {
+  if (r.status === 405) {
+    document.getElementById('chat').remove();
+    document.getElementById('show-terminal').remove();
+  }
+}).catch(() => {});
+
+// Welcome line in the log so the panel doesn't look empty on first boot.
+append('sys', 'kent.terminal · drag header to move · drag corner to resize · ⌘` to toggle');
+
+// ---------- graph ----------
+const G = ForceGraph3D()(document.getElementById('g'))
+  .backgroundColor('#000010')
+  .nodeId('id').nodeVal('val').nodeLabel('label')
+  .nodeColor(n => n.color || '#bbb')
+  .nodeOpacity(0.95)
+  .linkColor(l => l.color || '#444')
+  .linkOpacity(0.55)
+  // linkWidth > 0 forces 3d-force-graph to render links as 3D cylinder tubes
+  // instead of 1-pixel THREE.Line primitives. NOTE: linkWidth is the cylinder
+  // *world-space radius*, not a pixel value. With drawers at ~30 world-units
+  // from identity and the camera ~200+ units back, sub-1.0 widths are
+  // sub-pixel. Use bigger values than feel right.
+  .linkWidth(l => (l.type === 'tunnel' ? 4 : (l.type === 'passive_tunnel' ? 2.5 : 1.2)))
+  .linkDirectionalParticles(l => (l.type === 'tunnel' ? 6 : (l.type === 'passive_tunnel' ? 3 : 1)))
+  .linkDirectionalParticleSpeed(0.006)
+  .linkDirectionalParticleWidth(l => (l.type === 'tunnel' ? 1.4 : 0.6))
+  .nodeRelSize(4);
+
+try {
+  G.controls().autoRotate = true;
+  G.controls().autoRotateSpeed = 0.25;
+  G.controls().addEventListener('start', () => { G.controls().autoRotate = false; });
+} catch (err) { console.warn('autoRotate setup failed', err); }
+
+const FADE_MS = 1200;
+G.nodeVal(n => {
+  const age = Date.now()/1000 - (n.first_seen || 0);
+  if (age < 0 || age > FADE_MS/1000) return n.val;
+  return n.val * (age * 1000 / FADE_MS);
+});
+setInterval(() => G.refresh(), 100);
+
+// ---------- /events: snapshot stream ----------
+let prevNodeCount = 0;
+let prevHash = '';
+
+// Cheap structural hash so we skip re-applying graphData() when nothing
+// substantive changed. Without this, every incoming snapshot — including
+// ones that only differ in ephemeral first_seen timestamps — restarts the
+// force simulation, making the whole graph jitter continuously.
+function snapshotHash(data) {
+  const nodeIds = data.nodes.map(n => n.id).sort().join(',');
+  const linkPairs = data.links
+    .map(l => {
+      const s = typeof l.source === 'object' ? l.source.id : l.source;
+      const t = typeof l.target === 'object' ? l.target.id : l.target;
+      return s + '→' + t;
+    })
+    .sort()
+    .join(',');
+  return nodeIds + '|' + linkPairs;
+}
+
+const es = new EventSource('/events');
+es.onmessage = (e) => {
+  let data;
+  try { data = JSON.parse(e.data); }
+  catch (err) { console.error('bad snapshot json', err); return; }
+
+  if (data.empty) {
+    document.getElementById('hud').textContent = 'palace not initialized — start kent to populate';
+    return;
+  }
+
+  // Always update the HUD so the timestamp shows we're alive.
+  const n = data.nodes.length;
+  document.getElementById('n').textContent = n;
+  document.getElementById('d').textContent = data.nodes.filter(nn => nn.type === 'drawer').length;
+  document.getElementById('u').textContent = new Date().toLocaleTimeString();
+
+  const errEl = document.getElementById('err');
+  if (data.error) { errEl.textContent = 'snapshot: ' + data.error; errEl.style.display = 'block'; }
+  else            { errEl.style.display = 'none'; }
+  if (data.truncated) {
+    document.getElementById('hud').textContent += ' · ⚠ truncated at cap';
+  }
+
+  // Skip the graphData re-apply if structure is unchanged. Without this, every
+  // incoming snapshot — even ones that only differ in ephemeral first_seen —
+  // restarts the force simulation and the whole graph jitters continuously.
+  const h = snapshotHash(data);
+  if (h === prevHash) return;
+  prevHash = h;
+
+  G.graphData(data);
+
+  // Reframe the camera when the node count grows non-trivially. Without this,
+  // the initial auto-fit (computed on a tiny graph) leaves new nodes off-screen.
+  if (n > prevNodeCount + 4 || (prevNodeCount === 0 && n > 1)) {
+    setTimeout(() => { try { G.zoomToFit(800, 60); } catch (e) {} }, 1200);
+  }
+  prevNodeCount = n;
+};
+es.onerror = () => {
+  document.getElementById('err').textContent = 'live updates disconnected (auto-reconnecting)';
+  document.getElementById('err').style.display = 'block';
+};
+</script></body></html>
