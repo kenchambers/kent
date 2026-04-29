@@ -229,14 +229,15 @@ else
     ( uv run --quiet kent viz --port "$VIZ_PORT" >> "$VIZ_LOG" 2>&1 ) &
     VIZ_PID=$!
 
-    # Poll until the server binds (or give up after ~12s).
+    # Poll until the server binds (or give up after ~12s). Probe via bash's
+    # built-in /dev/tcp so this works on minimal images without curl/wget.
     BOOT_OK=""
     for _ in $(seq 1 60); do
         if ! kill -0 "$VIZ_PID" 2>/dev/null; then
             break
         fi
-        if command -v curl >/dev/null 2>&1 && \
-           curl -fsS --max-time 1 "http://127.0.0.1:$VIZ_PORT/" >/dev/null 2>&1; then
+        if (exec 3<>"/dev/tcp/127.0.0.1/$VIZ_PORT") 2>/dev/null; then
+            exec 3<&- 3>&-
             BOOT_OK=1
             break
         fi
