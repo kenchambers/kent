@@ -151,6 +151,11 @@ class StartupChoice:
     api_key: str
     context_window: int
     critic_model: str | None = None  # None = critic disabled
+    # NOTE: plan §"Files to modify" line 109 mentioned extending this struct
+    # with training fields. We chose to keep training config out of the
+    # interactive REPL path — `kent train` reads its own --pair / --rounds /
+    # swap_pairs.toml. Adding training fields here would create a confusing
+    # dual config surface for cmd_run/cmd_repl that never consume them.
 
 
 def _ensure_config_dir() -> None:
@@ -974,9 +979,20 @@ def cmd_train(args: argparse.Namespace) -> int:
             for i in range(train_size)
         ]
 
-    val_split = max(1, len(examples) // 5)
-    train_examples = [{"task_id": ex.task_id, "prompt": ex.prompt} for ex in examples]
-    val_examples = train_examples[:val_split]
+    # Plan §verification 6: hold out a portion to detect overfit-to-critic drift.
+    # 60/20/20 split when there is enough data; otherwise val and holdout collapse to val.
+    all_examples = [{"task_id": ex.task_id, "prompt": ex.prompt} for ex in examples]
+    n = len(all_examples)
+    if n >= 5:
+        holdout_size = max(1, n // 5)
+        val_size = max(1, n // 5)
+        train_examples = all_examples[: n - holdout_size - val_size]
+        val_examples = all_examples[n - holdout_size - val_size : n - holdout_size]
+        holdout_examples = all_examples[n - holdout_size :]
+    else:
+        train_examples = all_examples
+        val_examples = all_examples[: max(1, n // 2)] or all_examples
+        holdout_examples = []
 
     for pair in pairs:
         config = TrainingConfig(
@@ -1032,6 +1048,103 @@ def cmd_train(args: argparse.Namespace) -> int:
             f"val_reward={metrics['val_reward']:.3f}  "
             f"saved to {metrics['output_path']}"
         )
+
+        if holdout_examples:
+            from .training.eval_harness import evaluate_holdout, drift_gate
+
+            optimized_path = Path(metrics["output_path"])
+            optimized_prompt = (
+                optimized_path.read_text(encoding="utf-8")
+                if optimized_path.exists()
+                else None
+            )
+            set_active_config(config)
+            try:
+                holdout = asyncio.run(
+                    evaluate_holdout(
+                        holdout_examples,
+                        config=config,
+                        actor_system=optimized_prompt,
+                    )
+                )
+            finally:
+                set_active_config(None)
+            gate = drift_gate(metrics["val_reward"], holdout["holdout_mean"])
+            if gate["drift_detected"]:
+                print(
+                    f"[drift] val={gate['val_reward']:.3f} holdout={gate['holdout_reward']:.3f} "
+                    f"gap={gate['gap']:.3f} ≥ 0.10 — possible critic overfit",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"  holdout_reward={gate['holdout_reward']:.3f}  "
+                    f"gap={gate['gap']:.3f}"
+                )
+
+            metrics_dir = config.lightning_store / "metrics"
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            with open(metrics_dir / "drift.jsonl", "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "resource": resource,
+                            "pair": f"{pair.actor_model}+{pair.critic_model}",
+                            **gate,
+                            "holdout_n": holdout["n"],
+                        }
+                    )
+                    + "\n"
+                )
+
+        from .training.swap_pair import load_consensus_critic
+        consensus = load_consensus_critic()
+        if consensus and consensus.family != pair.critic_family:
+            from .training.eval_harness import consensus_check
+
+            primary_critic = OpenAICompatibleLLM(
+                base_url=pair.critic_base_url,
+                api_key=pair.critic_api_key,
+                model=pair.critic_model,
+            )
+            secondary_critic = OpenAICompatibleLLM(
+                base_url=consensus.base_url,
+                api_key=consensus.api_key,
+                model=consensus.model,
+            )
+            convo_samples = [
+                [
+                    {"role": "user", "content": ex["prompt"]},
+                    {"role": "assistant", "content": "ok."},
+                ]
+                for ex in (val_examples or all_examples[:3])[:5]
+            ]
+            try:
+                cresult = asyncio.run(
+                    consensus_check(primary_critic, secondary_critic, convo_samples)
+                )
+            except Exception as e:
+                cresult = {"error": str(e)}
+            if cresult.get("drift_detected"):
+                print(
+                    f"[consensus drift] rank_correlation="
+                    f"{cresult['rank_correlation']:.2f} — primary critic may be drifting",
+                    file=sys.stderr,
+                )
+            metrics_dir = config.lightning_store / "metrics"
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            with open(metrics_dir / "consensus.jsonl", "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "resource": resource,
+                            "primary": pair.critic_model,
+                            "consensus": consensus.model,
+                            **cresult,
+                        }
+                    )
+                    + "\n"
+                )
 
     return 0
 
@@ -1238,6 +1351,28 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
                     print(f"  {w:<20} {total_entries:>4} entries  last-write: {last_str}")
                 except Exception as e:
                     print(f"  {w:<20} <error: {e}>")
+    except Exception as e:
+        print(f"  error: {e}")
+
+    print()
+    print("[training metrics]")
+    try:
+        from .training.tunnel_utility import summarize_tunnel_metrics
+        from .memory.mempalace_store import _DEFAULT_KENT_HOME
+
+        metrics_dir = _DEFAULT_KENT_HOME / "lightning_store" / "metrics"
+        summary = summarize_tunnel_metrics(metrics_dir=metrics_dir)
+        obs = summary.get("observations", 0)
+        if obs == 0:
+            print("  tunnel utility : <no rollouts logged yet>")
+        else:
+            rate = summary.get("citation_rate", 0.0)
+            print(f"  tunnel utility : {obs} observations  citation_rate={rate:.2%}")
+            for tid, bucket in list(summary.get("by_tunnel", {}).items())[:5]:
+                seen = bucket["seen"]
+                cited = bucket["cited"]
+                tid_short = tid[:24] + ("…" if len(tid) > 24 else "")
+                print(f"    {tid_short:<26} {cited}/{seen} cited")
     except Exception as e:
         print(f"  error: {e}")
 

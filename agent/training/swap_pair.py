@@ -18,17 +18,31 @@ class SwapPair:
     critic_family: str
 
 
+@dataclass(frozen=True)
+class ConsensusCritic:
+    base_url: str
+    api_key: str
+    model: str
+    family: str
+
+
 class FamilyCollisionError(ValueError):
     pass
+
+
+def _read_toml(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        return tomllib.load(f)
 
 
 def load_pairs(config_path: Path | None = None) -> list[SwapPair]:
     """Load swap pairs from ~/.kent/swap_pairs.toml, rejecting same-family pairs."""
     path = config_path or Path.home() / ".kent" / "swap_pairs.toml"
-    if not path.exists():
+    data = _read_toml(path)
+    if data is None:
         return []
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
 
     actors = data.get("actors", [])
     critics = data.get("critics", [])
@@ -51,6 +65,28 @@ def load_pairs(config_path: Path | None = None) -> list[SwapPair]:
                 critic_family=critic["family"],
             ))
     return pairs
+
+
+def load_consensus_critic(config_path: Path | None = None) -> ConsensusCritic | None:
+    """Load the optional [consensus_critic] block from swap_pairs.toml.
+
+    Used by Plan §"Cross-critic consensus check": a third critic from a
+    different family that scores rollouts alongside the primary so we can
+    detect rank-correlation drift over time.
+    """
+    path = config_path or Path.home() / ".kent" / "swap_pairs.toml"
+    data = _read_toml(path)
+    if not data:
+        return None
+    block = data.get("consensus_critic")
+    if not block:
+        return None
+    return ConsensusCritic(
+        base_url=block["base_url"],
+        api_key=block.get("api_key", ""),
+        model=block["model"],
+        family=block["family"],
+    )
 
 
 def sweep_pairs(config_path: Path | None = None) -> Iterator[SwapPair]:

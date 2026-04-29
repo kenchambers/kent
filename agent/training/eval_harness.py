@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import statistics
-from typing import Any
+from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
 
 COLLUSION_PROBE_THRESHOLD = 1 / 5
 CONSENSUS_DRIFT_THRESHOLD = 0.3
+HOLDOUT_DRIFT_THRESHOLD = 0.1
 
 
 async def run_collusion_probes(
@@ -108,3 +109,43 @@ def _rank_correlation(xs: list[float], ys: list[float]) -> float:
 
     d_sq_sum = sum((rx[i] - ry[i]) ** 2 for i in range(n))
     return 1.0 - (6 * d_sq_sum) / (n * (n * n - 1))
+
+
+async def evaluate_holdout(
+    holdout_dataset: Sequence[dict[str, Any]],
+    *,
+    config: Any,
+    actor_system: str | None,
+) -> dict[str, Any]:
+    """Run kent_task_rollout against each holdout example and average the reward.
+
+    Plan §verification 6: drift = |val_reward - holdout_reward|. A gap above
+    HOLDOUT_DRIFT_THRESHOLD (0.1) signals overfitting to the critic.
+    """
+    from .rollout import kent_task_rollout
+
+    rewards: list[float] = []
+    for ex in holdout_dataset:
+        prompt = ex.get("prompt", "")
+        task_id = ex.get("task_id")
+        try:
+            r = await kent_task_rollout(
+                prompt, config=config, actor_system=actor_system, task_id=task_id
+            )
+        except Exception:
+            logger.warning("holdout rollout failed for %s", task_id, exc_info=True)
+            r = 0.0
+        rewards.append(r)
+    mean = statistics.mean(rewards) if rewards else 0.0
+    return {"holdout_mean": mean, "n": len(rewards), "rewards": rewards}
+
+
+def drift_gate(val_reward: float, holdout_reward: float) -> dict[str, Any]:
+    """Plan §verification 6 gate: |val − holdout| < 0.1, else flag overfitting."""
+    gap = abs(val_reward - holdout_reward)
+    return {
+        "val_reward": val_reward,
+        "holdout_reward": holdout_reward,
+        "gap": gap,
+        "drift_detected": gap >= HOLDOUT_DRIFT_THRESHOLD,
+    }

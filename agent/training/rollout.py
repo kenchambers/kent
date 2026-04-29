@@ -7,6 +7,7 @@ from typing import Any
 
 from .palace_isolation import snapshot, cleanup, assert_isolation
 from .critic_scorer import score_rollout
+from .tunnel_utility import log_rollout_tunnel_observations
 from . import TrainingConfig
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ async def _run_rollout_impl(
         TaskStart,
         TaskEnd,
     )
+    from agent.builtin.tunnel_create import TunnelCreate
     from agent.loop import run as loop_run
     from agent.cli import build_registry, _build_system_prompt
     from agent.events import AssistantMessageComplete, ToolResult as ToolResultEv
@@ -114,6 +116,7 @@ async def _run_rollout_impl(
         registry.register(MemoryRecallHere(memory_store))  # type: ignore[arg-type]
         registry.register(DiaryWrite(memory_store))  # type: ignore[arg-type]
         registry.register(SetWing(memory_store))  # type: ignore[arg-type]
+        registry.register(TunnelCreate())  # type: ignore[arg-type]
         registry.register(TaskStart())  # type: ignore[arg-type]
         registry.register(TaskEnd())  # type: ignore[arg-type]
 
@@ -140,6 +143,18 @@ async def _run_rollout_impl(
         logger.info(
             "rollout %s reward=%.3f", task_id or rollout_internal_id, reward
         )
+
+        try:
+            metrics_dir = config.lightning_store / "metrics"
+            log_rollout_tunnel_observations(
+                task_id or rollout_internal_id or "",
+                collected,
+                active_wing=memory_store.active_wing,
+                metrics_dir=metrics_dir,
+            )
+        except Exception:
+            logger.debug("tunnel-utility logging failed", exc_info=True)
+
         return reward, collected, score.rationale
 
     except Exception:
