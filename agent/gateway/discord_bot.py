@@ -275,7 +275,23 @@ class DiscordGateway:
 
         history = [*session.history, {"role": "user", "content": user_text}]
         new_messages: list[dict] = []
-        final_text = ""
+        sent_any_text = False
+        terminal_reason: str | None = None
+
+        async def _send(text: str) -> bool:
+            nonlocal sent_any_text
+            ok = False
+            for chunk in _split_for_discord(text):
+                if not chunk:
+                    continue
+                try:
+                    await message.channel.send(chunk)
+                    sent_any_text = True
+                    ok = True
+                except Exception:
+                    logger.exception("reply send failed")
+                    return ok
+            return ok
 
         try:
             async with message.channel.typing():
@@ -284,14 +300,16 @@ class DiscordGateway:
                     tools=session.registry,
                     llm=self._llm,
                     system=system_prompt,
-                    max_turns=15,
+                    max_turns=25,
                     memory_store=session.store,
                 ):
                     if isinstance(ev, AssistantMessageComplete):
                         new_messages.append(ev.message.to_openai_dict())
-                        if ev.message.content:
-                            final_text = ev.message.content
+                        text = (ev.message.content or "").strip()
+                        if text:
+                            await _send(text)
                     elif isinstance(ev, Terminal):
+                        terminal_reason = ev.reason
                         break
         except Exception:
             logger.exception("agent run failed")
@@ -305,14 +323,17 @@ class DiscordGateway:
 
         session.history = [*history, *new_messages]
 
-        if final_text.strip():
-            for chunk in _split_for_discord(final_text):
-                if chunk:
-                    try:
-                        await message.channel.send(chunk)
-                    except Exception:
-                        logger.exception("final reply send failed")
-                        break
+        # If the run terminated for any reason other than `completed` without ever
+        # producing a user-visible reply, surface the silence so the channel doesn't
+        # look dead. completed = LLM ended on a text-only turn (Phase 4 of loop.py).
+        if terminal_reason and terminal_reason != "completed" and not sent_any_text:
+            try:
+                await message.channel.send(
+                    f"[gateway] run terminated ({terminal_reason}) without producing a "
+                    "final reply. Reply to continue or rephrase."
+                )
+            except Exception:
+                logger.exception("fallback send failed")
 
     def _start_heartbeat(self) -> None:
         from .heartbeat import Heartbeat, parse_interval
@@ -346,7 +367,7 @@ class DiscordGateway:
                     tools=session.registry,
                     llm=self._llm,
                     system=system_prompt,
-                    max_turns=15,
+                    max_turns=25,
                     memory_store=session.store,
                 ):
                     if isinstance(ev, AssistantMessageComplete):
