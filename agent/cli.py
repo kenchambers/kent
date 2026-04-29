@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -1390,6 +1391,314 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- gateway -------------------------------------------------------- #
+
+def _resolve_discord_token() -> str | None:
+    """Discord token resolution: env wins over saved credential. Never prompts."""
+    if (val := os.environ.get("KENT_DISCORD_BOT_TOKEN")):
+        return val
+    if (val := load_credentials().get("discord_bot_token")):
+        return val
+    return None
+
+
+def _load_gateway_settings(args: argparse.Namespace) -> "Any":
+    """Build a DiscordSettings dataclass from saved config + CLI flags."""
+    from .gateway.discord_bot import DiscordSettings
+
+    cfg = load_config()
+    block = cfg.get("gateway") or {}
+    mention_only = block.get("mention_only", True)
+    if getattr(args, "mention_only", False):
+        mention_only = True
+    if getattr(args, "all_messages", False):
+        mention_only = False
+    status = getattr(args, "status", None) or block.get("status", "online")
+    activity = getattr(args, "activity", None) or block.get("activity", "thinking")
+    log_file_str = getattr(args, "log_file", None) or str(CONFIG_DIR / "gateway.log")
+    return DiscordSettings(
+        mention_only=mention_only,
+        status=status,
+        activity=activity,
+        log_file=Path(log_file_str),
+    )
+
+
+def _gateway_make_llm(
+    service_override: str | None = None,
+    model_override: str | None = None,
+) -> OpenAICompatibleLLM:
+    cfg = load_config()
+    svc_id = service_override or cfg.get("service_id") or next(iter(SUPPORTED_SERVICES))
+    svc = SUPPORTED_SERVICES.get(svc_id, next(iter(SUPPORTED_SERVICES.values())))
+    model = model_override or cfg.get("model") or svc["default_model"]
+    api_key = resolve_api_key(svc_id, prompt_if_missing=False) or ""
+    return OpenAICompatibleLLM(
+        base_url=svc["base_url"],
+        api_key=api_key,
+        model=model,
+        context_window=svc["default_context_window"],
+    )
+
+
+def cmd_gateway_run(args: argparse.Namespace) -> int:
+    """Foreground: run the Discord bot loop until Ctrl-C / disconnect."""
+    token = _resolve_discord_token()
+    if not token:
+        print(
+            "no Discord bot token. Run `kent gateway config` (or set "
+            "KENT_DISCORD_BOT_TOKEN).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        import discord  # noqa: F401
+    except ImportError:
+        print(
+            "discord.py not installed. Run: uv pip install 'discord.py>=2.4'",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .gateway.discord_bot import run_gateway
+
+    settings = _load_gateway_settings(args)
+    service_override = getattr(args, "service", None)
+    model_override = getattr(args, "model", None)
+    wing_override = getattr(args, "wing", None)
+
+    def _system_prompt_factory(store):
+        return _build_system_prompt(store)
+
+    def _llm_factory():
+        return _gateway_make_llm(service_override, model_override)
+
+    print(
+        f"[gateway] starting (mention_only={settings.mention_only}, "
+        f"status={settings.status})",
+        flush=True,
+    )
+
+    try:
+        asyncio.run(
+            run_gateway(
+                token=token,
+                settings=settings,
+                llm_factory=_llm_factory,
+                system_prompt_factory=_system_prompt_factory,
+                wing_override=wing_override,
+            )
+        )
+    except KeyboardInterrupt:
+        print("\n[gateway] stopped (interrupt)", flush=True)
+        return 0
+    except Exception as e:
+        print(f"[gateway] crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _build_run_argv(args: argparse.Namespace) -> list[str]:
+    """Reconstruct an argv list for `kent gateway run` from a parsed `start` args."""
+    argv = [sys.executable, "-m", "agent.cli", "gateway", "run"]
+    if getattr(args, "mention_only", False):
+        argv.append("--mention-only")
+    if getattr(args, "all_messages", False):
+        argv.append("--all-messages")
+    status = getattr(args, "status", None)
+    if status:
+        argv += ["--status", status]
+    activity = getattr(args, "activity", None)
+    if activity:
+        argv += ["--activity", activity]
+    log_file = getattr(args, "log_file", None)
+    if log_file:
+        argv += ["--log-file", log_file]
+    service = getattr(args, "service", None)
+    if service:
+        argv += ["--service", service]
+    model = getattr(args, "model", None)
+    if model:
+        argv += ["--model", model]
+    wing = getattr(args, "wing", None)
+    if wing:
+        argv += ["--wing", wing]
+    return argv
+
+
+def cmd_gateway_start(args: argparse.Namespace) -> int:
+    from .gateway import lifecycle as lc
+
+    existing = lc.read_pid()
+    if existing is not None:
+        print(f"gateway already running (pid {existing}). Use `kent gateway stop` first.")
+        return 0
+
+    token = _resolve_discord_token()
+    if not token:
+        print(
+            "no Discord bot token. Run `kent gateway config`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    settings = _load_gateway_settings(args)
+    log_path = settings.log_file or (CONFIG_DIR / "gateway.log")
+
+    argv = _build_run_argv(args)
+    pid = lc.spawn_detached(argv, log_path)
+    lc.write_pid(pid)
+    print(f"gateway started (pid {pid}) — log: {log_path}")
+    return 0
+
+
+def cmd_gateway_stop(_args: argparse.Namespace) -> int:
+    from .gateway import lifecycle as lc
+
+    pid = lc.read_pid()
+    if pid is None:
+        print("no running gateway")
+        return 0
+    if lc.stop(pid):
+        lc.clear_pid()
+        print(f"stopped (pid {pid})")
+        return 0
+    print(f"failed to stop pid {pid}", file=sys.stderr)
+    return 1
+
+
+def cmd_gateway_restart(args: argparse.Namespace) -> int:
+    rc = cmd_gateway_stop(args)
+    if rc != 0:
+        return rc
+    return cmd_gateway_start(args)
+
+
+def cmd_gateway_status(_args: argparse.Namespace) -> int:
+    from .gateway import lifecycle as lc
+
+    pid = lc.read_pid()
+    if pid is None:
+        print("not running")
+        return 0
+
+    log_path = CONFIG_DIR / "gateway.log"
+    status = lc.read_status()
+    uptime_str = "<unknown>"
+    try:
+        mtime = lc.pid_path().stat().st_mtime
+        seconds = max(0.0, time.time() - mtime)
+        uptime_str = _format_uptime(seconds)
+    except OSError:
+        pass
+
+    channels = status.get("channels")
+    user = status.get("user")
+    ready_at = status.get("ready_at")
+    head = f"running (pid {pid})"
+    if user:
+        head += f" — connected as {user}"
+    print(head)
+    print(f"  uptime  : {uptime_str}")
+    if channels is not None:
+        print(f"  channels: {channels}")
+    if ready_at:
+        print(f"  ready at: {ready_at}")
+    print(f"  pid file: {lc.pid_path()}")
+    print(f"  log     : {log_path}")
+    return 0
+
+
+def _format_uptime(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        h, rem = divmod(s, 3600)
+        return f"{h}h{rem // 60:02d}m"
+    d, rem = divmod(s, 86400)
+    return f"{d}d{rem // 3600:02d}h"
+
+
+def cmd_gateway_config(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    block = dict(cfg.get("gateway") or {})
+
+    if getattr(args, "reset", False):
+        cfg.pop("gateway", None)
+        save_config(cfg)
+        creds = load_credentials()
+        if creds.pop("discord_bot_token", None) is not None:
+            save_credentials(creds)
+        print("[gateway] config reset (token cleared, defaults removed)")
+        return 0
+
+    changed = False
+    if getattr(args, "mention_only", False):
+        block["mention_only"] = True
+        changed = True
+    if getattr(args, "all_messages", False):
+        block["mention_only"] = False
+        changed = True
+    if getattr(args, "status", None):
+        block["status"] = args.status
+        changed = True
+    if getattr(args, "activity", None):
+        block["activity"] = args.activity
+        changed = True
+    if changed:
+        cfg["gateway"] = block
+        save_config(cfg)
+        print("[gateway] saved defaults to config.json")
+
+    set_token = getattr(args, "token", False)
+    if set_token or (not changed and not getattr(args, "show", False)):
+        # Default behavior with no flags: prompt for the token
+        import getpass
+        entered = getpass.getpass(
+            "Discord bot token (paste; nothing echoes): "
+        ).strip()
+        if not entered:
+            print("[gateway] no token entered; not changing credentials")
+        else:
+            creds = load_credentials()
+            creds["discord_bot_token"] = entered
+            save_credentials(creds)
+            print(f"saved to {CREDENTIALS_PATH} (chmod 0600 attempted)")
+
+    print()
+    print("[gateway settings]")
+    print(f"  mention_only : {block.get('mention_only', True)}")
+    print(f"  status       : {block.get('status', 'online')}")
+    print(f"  activity     : {block.get('activity', 'thinking')}")
+    creds = load_credentials()
+    has_token = bool(_resolve_discord_token())
+    print(f"  token        : {'set' if has_token else '<unset — run `kent gateway config`>'}")
+    return 0
+
+
+_GATEWAY_DISPATCH = {
+    "run": cmd_gateway_run,
+    "start": cmd_gateway_start,
+    "stop": cmd_gateway_stop,
+    "restart": cmd_gateway_restart,
+    "status": cmd_gateway_status,
+    "config": cmd_gateway_config,
+}
+
+
+def cmd_gateway(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", None) or "start"
+    fn = _GATEWAY_DISPATCH.get(action)
+    if fn is None:
+        print(f"unknown gateway action: {action!r}", file=sys.stderr)
+        return 2
+    return fn(args)
+
+
 # ---------- viz ------------------------------------------------------------- #
 
 def cmd_viz(args: argparse.Namespace) -> int:
@@ -1548,6 +1857,84 @@ def _build_parser() -> argparse.ArgumentParser:
     p_viz.add_argument("--read-only", action="store_true",
                        help="disable the chat panel; just render the palace")
     p_viz.set_defaults(func=cmd_viz)
+
+    # `kent gateway {run,start,stop,restart,status,config}`
+    p_gateway = sub.add_parser(
+        "gateway",
+        help="Run kent as a Discord bot (mention-only by default)",
+    )
+    p_gateway.add_argument(
+        "action",
+        nargs="?",
+        default="start",
+        choices=["run", "start", "stop", "restart", "status", "config"],
+        help="What to do (default: start)",
+    )
+    p_gateway.add_argument(
+        "--mention-only",
+        dest="mention_only",
+        action="store_true",
+        help="Only respond when @mentioned (default)",
+    )
+    p_gateway.add_argument(
+        "--all-messages",
+        dest="all_messages",
+        action="store_true",
+        help="Respond to every message in any channel the bot can see",
+    )
+    p_gateway.add_argument(
+        "--status",
+        default=None,
+        choices=["online", "idle", "dnd", "invisible"],
+        help="Initial Discord presence (default: online)",
+    )
+    p_gateway.add_argument(
+        "--activity",
+        default=None,
+        metavar="STR",
+        help="Activity string ('Playing X' / 'thinking'; default: 'thinking')",
+    )
+    p_gateway.add_argument(
+        "--log-file",
+        dest="log_file",
+        default=None,
+        metavar="PATH",
+        help="Where the detached gateway writes stdout/stderr (default: ~/.kent/gateway.log)",
+    )
+    p_gateway.add_argument(
+        "--service",
+        default=None,
+        choices=list(SUPPORTED_SERVICES),
+        help="Override saved LLM service for this gateway run",
+    )
+    p_gateway.add_argument(
+        "--model",
+        default=None,
+        metavar="MODEL_ID",
+        help="Override saved model for this gateway run",
+    )
+    p_gateway.add_argument(
+        "--wing",
+        default=None,
+        metavar="WING",
+        help="Force every Discord channel to use this wing (overrides per-channel naming)",
+    )
+    p_gateway.add_argument(
+        "--token",
+        action="store_true",
+        help="(config only) Prompt for and save a Discord bot token",
+    )
+    p_gateway.add_argument(
+        "--reset",
+        action="store_true",
+        help="(config only) Clear saved gateway settings + token",
+    )
+    p_gateway.add_argument(
+        "--show",
+        action="store_true",
+        help="(config only) Show current settings without prompting for a token",
+    )
+    p_gateway.set_defaults(func=cmd_gateway)
 
     return parser
 

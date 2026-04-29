@@ -28,6 +28,8 @@ CREDS_DEST="$KENT_HOME/credentials.json"
 VIZ_PORT="${KENT_VIZ_PORT:-8765}"
 VIZ_LOG="$KENT_HOME/viz.log"
 VIZ_PID=""
+GATEWAY_LOG="$KENT_HOME/gateway.log"
+GATEWAY_PID=""
 
 # ---------- colors / fx ---------------------------------------------------- #
 
@@ -90,6 +92,12 @@ cleanup() {
         printf "\n  ${C_GREY}[viz  ]${C_RESET} stopping (pid %s)…" "$VIZ_PID"
         kill "$VIZ_PID" 2>/dev/null || true
         wait "$VIZ_PID" 2>/dev/null || true
+        printf " ${C_GREEN}done${C_RESET}\n"
+    fi
+    if [[ -n "$GATEWAY_PID" ]] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
+        printf "\n  ${C_GREY}[gw   ]${C_RESET} stopping (pid %s)…" "$GATEWAY_PID"
+        kill "$GATEWAY_PID" 2>/dev/null || true
+        wait "$GATEWAY_PID" 2>/dev/null || true
         printf " ${C_GREEN}done${C_RESET}\n"
     fi
     tput cnorm 2>/dev/null || true
@@ -247,6 +255,34 @@ else
                 xdg-open "http://127.0.0.1:$VIZ_PORT" >/dev/null 2>&1 || true
             fi
         fi
+    fi
+fi
+
+# ---------- 4b. launch gateway (background, optional) -------------------- #
+
+if [ "${KENT_NO_GATEWAY:-0}" = "1" ]; then
+    boot_line "gw   " "${C_DIM}skipped (KENT_NO_GATEWAY=1)${C_RESET}" "$C_GOLD"
+else
+    HAS_TOKEN="$(uv run --quiet python - "$CREDS_DEST" <<'PY'
+import json, os, sys
+dest = sys.argv[1]
+if not os.path.exists(dest):
+    print("0"); sys.exit(0)
+try:
+    data = json.loads(open(dest).read())
+    print("1" if isinstance(data, dict) and data.get("discord_bot_token") else "0")
+except Exception:
+    print("0")
+PY
+)"
+    if [ "$HAS_TOKEN" = "1" ]; then
+        boot_line "gw   " "spawning Discord gateway"
+        : > "$GATEWAY_LOG"
+        ( uv run --quiet kent gateway run >> "$GATEWAY_LOG" 2>&1 ) &
+        GATEWAY_PID=$!
+        boot_line "gw   " "spawned (pid ${C_BOLD}${GATEWAY_PID}${C_RESET}) — log: ${C_BOLD}${GATEWAY_LOG}${C_RESET}" "$C_GREEN"
+    else
+        boot_line "gw   " "${C_DIM}disabled (no token — run \`kent gateway config\`)${C_RESET}" "$C_GOLD"
     fi
 fi
 

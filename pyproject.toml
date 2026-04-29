@@ -12,6 +12,7 @@ dependencies = [
     "mempalace>=3.3",
     "agentlightning>=0.1",
     "poml>=0.0.8",
+    "discord.py>=2.4",
 ]
 
 [project.scripts]
@@ -41,4 +42,5 @@ markers = [
     "memory: tests requiring real MemPalace store (deselect with -m 'not memory')",
     "slow: long-running scale tests (deselect with -m 'not slow')",
     "live_apo: end-to-end APO training against a real LLM endpoint (select with -m live_apo)",
+    "live_discord: end-to-end Discord gateway tests (select with -m live_discord)",
 ]

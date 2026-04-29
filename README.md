@@ -15,10 +15,12 @@ The Python package is imported as `agent`; the installed CLI binary is `kent`.
   - [2. Launch the REPL](#2-launch-the-repl)
   - [3. One-shot mode](#3-one-shot-mode)
   - [4. Open the live 3D palace viewer + chat](#4-open-the-live-3d-palace-viewer--chat)
+  - [5. Talk to kent on Discord](#5-talk-to-kent-on-discord)
 - [CLI reference](#cli-reference)
   - [`kent`](#kent-1)
   - [`kent run`](#kent-run)
   - [`kent viz`](#kent-viz)
+  - [`kent gateway`](#kent-gateway)
   - [`kent auth`](#kent-auth)
   - [`kent models`](#kent-models)
   - [`kent doctor`](#kent-doctor)
@@ -223,6 +225,18 @@ The page is one static HTML file with two SSE streams under the hood: `/events` 
 
 Requirements: `mempalace` must be installed (it is, by default — `uv sync` pulls it in). For the chat panel, `kent auth` (or `ATLASCLOUD_API_KEY`) must be set; pass `--read-only` to skip the LLM/auth setup. The server binds `127.0.0.1` only — there is no auth, by design.
 
+### 5. Talk to kent on Discord
+
+kent can also live on Discord as a bot — read messages, reply, react, manage threads, set presence — with each channel/DM mapped to its own memory wing. The gateway is a managed background service; once a token is saved, `dev-startup.sh` auto-starts it alongside `kent viz`.
+
+```bash
+kent gateway config             # paste your bot token (see docs/gateway.md for app setup)
+kent gateway start              # detach the daemon
+kent gateway status             # is it running? where's the log?
+```
+
+See [docs/gateway.md](docs/gateway.md) for the full Discord application walkthrough (creating the app, enabling intents, generating an invite URL).
+
 ## CLI reference
 
 ### `kent`
@@ -256,6 +270,40 @@ Launches the live 3D palace viewer + chat panel on `http://127.0.0.1:<port>`. Th
 | `--read-only`  | off     | Disable the chat panel; render the palace only (no API key needed) |
 
 Exits 0 on Ctrl-C, 1 if `mempalace` isn't importable, 2 if chat is enabled but no API key is configured (run `kent auth` or pass `--read-only`).
+
+### `kent gateway`
+
+```
+kent gateway [run|start|stop|restart|status|config] [flags]
+```
+
+Runs kent as a Discord bot. Each channel/DM maps to its own memory wing (`discord_<guild_id>_<channel_id>` or `discord_dm_<user_id>`). Discord tools (`discord_send`, `discord_react`, `discord_thread_create`, `discord_set_status`, `discord_read_history`) are registered into the bot's tool registry — they are *not* available in the local REPL or `kent run`.
+
+| Subaction  | What it does                                              |
+|------------|-----------------------------------------------------------|
+| `run`      | Foreground — runs the bot loop until Ctrl-C / disconnect  |
+| `start`    | Detach a daemon child; write `~/.kent/gateway.pid`        |
+| `stop`     | SIGTERM the pid (await 10s), SIGKILL on timeout, clear pid |
+| `restart`  | `stop` then `start`                                       |
+| `status`   | Print pid, uptime, channel count, ready timestamp, log path |
+| `config`   | Prompt for bot token (chmod 0600), edit gateway defaults  |
+
+Flags for `run` / `start` / `restart`:
+
+| Flag             | Default              | What it does                                                |
+|------------------|----------------------|-------------------------------------------------------------|
+| `--mention-only` | on                   | Only respond when @-mentioned                               |
+| `--all-messages` | off                  | Respond to every message in visible channels                |
+| `--status`       | `online`             | Initial presence: `online`/`idle`/`dnd`/`invisible`         |
+| `--activity`     | `thinking`           | "Playing X" / "Watching X" string                           |
+| `--log-file`     | `~/.kent/gateway.log`| Where the detached process writes stdout/stderr             |
+| `--service`      | (saved config)       | Override LLM service (e.g. `atlascloud`) for this run       |
+| `--model`        | (saved config)       | Override model id for this run                              |
+| `--wing`         | (per-channel auto)   | Pin every channel/DM to a single wing (overrides per-channel naming) |
+
+Status side-files: `~/.kent/gateway.pid` is written at start; `~/.kent/gateway.status.json` is updated on connect and per new channel session — both are removed on `kent gateway stop`.
+
+Requires `discord.py` (installed via `uv sync` once `pyproject.toml` is updated). See [docs/gateway.md](docs/gateway.md) for the Discord application walkthrough.
 
 ### `kent auth`
 
@@ -316,6 +364,13 @@ Health check. Prints OS / shell backend, web-search provider, config-file paths,
 | `memory_recall_here`  | Wing-scoped semantic search over the active wing's diary             | none    | yes              |
 | `diary_write`         | Append an entry (OBSERVATION / FINDING / DECISION / PATTERN) to the active wing's diary | none | no |
 | `set_wing`            | Switch to or register a named project wing                           | none    | no               |
+| `discord_send`†       | Post a message to a Discord channel (chunked at 1900 chars)          | bot token | yes            |
+| `discord_react`†      | Add a reaction emoji to a Discord message                            | bot token | yes            |
+| `discord_thread_create`† | Open a public thread (with optional parent message anchor)        | bot token | no             |
+| `discord_set_status`† | Change the bot's presence (online / idle / dnd / invisible)          | bot token | no             |
+| `discord_read_history`† | Read recent messages in chronological order                        | bot token | yes            |
+
+† Discord tools are only registered inside `kent gateway run`; they require a live Discord WebSocket and won't appear in `kent` REPL or `kent run`.
 
 Concurrency-safe tools batch and run in parallel via `StreamingExecutor`; unsafe tools (like `shell`) serialize so they can't race state mutations.
 
@@ -339,6 +394,9 @@ Files live under `~/.kent/` (override with `KENT_HOME=/some/path`):
 | `~/.kent/diaries/<wing>/`            | Per-wing diary directory              | Created on first diary write |
 | `~/.kent/diaries/<wing>/.intent.txt` | One-line wing description             | Written at wing creation |
 | `~/.kent/diaries/<wing>/YYYY-MM-DD.md` | Daily diary entries               | Append-only; ingested into palace |
+| `~/.kent/gateway.pid`                | PID of the running gateway daemon     | Written by `kent gateway start`; cleared by `stop` |
+| `~/.kent/gateway.status.json`        | Live snapshot: connected user, channel count, ready timestamp | Updated by the daemon on connect + each new channel session; cleared by `stop` |
+| `~/.kent/gateway.log`                | Gateway stdout/stderr                 | Append-only; rotates on `dev-startup.sh` boot |
 
 Override with environment:
 
@@ -347,6 +405,8 @@ Override with environment:
 | `KENT_HOME`            | Use a different config dir (default `~/.kent`)               |
 | `KENT_WING`            | Set the active wing for a session (overrides `active_wing.txt`) |
 | `ATLASCLOUD_API_KEY`   | Atlas Cloud API key — wins over saved credential             |
+| `KENT_DISCORD_BOT_TOKEN` | Discord bot token — wins over saved credential             |
+| `KENT_NO_GATEWAY=1`    | Skip launching the Discord gateway in `dev-startup.sh`       |
 
 ## Library use
 
@@ -445,6 +505,7 @@ async for ev in run(..., signal=signal):
 uv run pytest -m "not integration and not memory and not slow"   # offline suite (default)
 uv run pytest tests/training/                                    # training subsystem only
 uv run pytest -m live_apo -v -s                                  # live LLM + APO tests (Atlas Cloud key required)
+uv run pytest -m live_discord -v -s                              # live Discord gateway (requires KENT_DISCORD_BOT_TOKEN + KENT_DISCORD_TEST_CHANNEL_ID)
 uv run pytest tests/integration/                                 # live mempalace / ollama
 ```
 
