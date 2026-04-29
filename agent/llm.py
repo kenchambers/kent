@@ -47,7 +47,12 @@ class OpenAICompatibleLLM:
         _client is a test-injection hook; omit in production.
         """
         from openai import AsyncOpenAI
-        self.client = _client or AsyncOpenAI(base_url=base_url, api_key=api_key)
+        import httpx
+        self.client = _client or AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0),
+        )
         self.model = model
         self._context_window = context_window
 
