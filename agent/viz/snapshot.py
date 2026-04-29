@@ -6,6 +6,7 @@ from agent.memory.wings import list_wings
 
 logger = logging.getLogger(__name__)
 DRAWER_HARD_CAP = 5_000
+KENT_HOME = Path.home() / ".kent"
 
 _first_seen: dict[str, float] = {}
 
@@ -182,7 +183,50 @@ def build_snapshot(palace_path: Path, kent_home: Path) -> dict:
         error = f"{type(e).__name__}: {e}"
         logger.exception("snapshot build failed")
 
+    # Pathway overlay: annotate wings/queries that triggered repeated training
+    pathway_data = _build_pathway_overlay(kent_home)
+
     return {
         "nodes": nodes, "links": links,
         "truncated": truncated, "error": error,
+        "pathways": pathway_data,
     }
+
+
+def _build_pathway_overlay(kent_home: Path) -> dict:
+    """Return pathway summary data for the viz HUD and node annotations."""
+    try:
+        from agent.training.scout import read_pathways, PATHWAYS_PATH
+        pathways = read_pathways(PATHWAYS_PATH)
+        if not pathways:
+            return {"count": 0, "by_wing": {}, "by_resource": {}}
+
+        by_wing: dict[str, int] = {}
+        by_resource: dict[str, int] = {}
+        recent: list[dict] = []
+
+        for p in pathways:
+            wing = p.get("wing") or "unknown"
+            resource = p.get("resource", "")
+            by_wing[wing] = by_wing.get(wing, 0) + 1
+            by_resource[resource] = by_resource.get(resource, 0) + 1
+
+        # Most recent 5 pathways for HUD
+        sorted_p = sorted(pathways, key=lambda x: x.get("created_at", 0), reverse=True)
+        for p in sorted_p[:5]:
+            recent.append({
+                "wing": p.get("wing"),
+                "resource": p.get("resource"),
+                "drift_detected": p.get("drift_detected"),
+                "created_at": p.get("created_at"),
+            })
+
+        return {
+            "count": len(pathways),
+            "by_wing": by_wing,
+            "by_resource": by_resource,
+            "recent": recent,
+        }
+    except Exception:
+        logger.debug("pathway overlay build failed", exc_info=True)
+        return {"count": 0, "by_wing": {}, "by_resource": {}}

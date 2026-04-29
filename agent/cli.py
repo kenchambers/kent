@@ -380,6 +380,7 @@ async def _run_once(
     quiet_tools: bool = False,
     memory_store: "MemoryStore | None" = None,
     system_prompt: str = _SYSTEM_PROMPT_BASE,
+    collector: "Any | None" = None,
 ) -> tuple[list[dict], str]:
     """Single agent turn. Returns (new_history, terminal_reason)."""
     history = [*history, {"role": "user", "content": user_input}]
@@ -401,6 +402,8 @@ async def _run_once(
             max_turns=15,
             memory_store=memory_store,
         ):
+            if collector is not None:
+                collector.observe(ev)
             if isinstance(ev, TextDelta):
                 _stop_spinner()
                 print(ev.text, end="", flush=True)
@@ -447,6 +450,7 @@ async def _stream_one_turn(
     quiet_tools: bool = False,
     memory_store: "MemoryStore | None" = None,
     system_prompt: str = _SYSTEM_PROMPT_BASE,
+    collector: "Any | None" = None,
 ) -> tuple[list[dict], str]:
     """
     Run one turn; if a critic is provided and the turn completed cleanly,
@@ -455,7 +459,7 @@ async def _stream_one_turn(
     history, reason = await _run_once(
         registry, llm, history, user_input,
         quiet_tools=quiet_tools, memory_store=memory_store,
-        system_prompt=system_prompt,
+        system_prompt=system_prompt, collector=collector,
     )
     if critic_llm is None or reason != "completed":
         return history, reason
@@ -473,7 +477,7 @@ async def _stream_one_turn(
     return await _run_once(
         registry, llm, history, injected,
         quiet_tools=quiet_tools, memory_store=memory_store,
-        system_prompt=system_prompt,
+        system_prompt=system_prompt, collector=collector,
     )
 
 
@@ -493,6 +497,9 @@ slash commands:
   /wing <name>           switch to a wing (must exist)
   /wings                 list all wings with intents
   /diary <text>          record an OBSERVATION in the active wing's diary
+  /suggest               list pending training suggestions (scout)
+  /suggest accept <N>    accept suggestion #N and launch training
+  /suggest reject <N>    reject suggestion #N
   /exit, /quit           leave the session
 """
 
@@ -676,9 +683,72 @@ def _handle_slash(
                     print("diary not supported for this store type")
             except Exception as e:
                 print(f"  error: {e}")
+    elif head.startswith("/suggest"):
+        rest = cmd_stripped[len("/suggest"):].strip()
+        _handle_suggest(rest)
     else:
         print(f"unknown slash command: {cmd!r}. /help for the list.")
     return history, False
+
+
+def _handle_suggest(rest: str) -> None:
+    """Handle /suggest, /suggest accept N, /suggest reject N."""
+    from .training.scout import SuggestionStore, ACCEPTED, REJECTED
+    store = SuggestionStore()
+
+    if not rest:
+        pending = store.list_pending()
+        if not pending:
+            print("  no pending training suggestions")
+            return
+        for i, row in enumerate(pending, 1):
+            score_str = f"score={row.get('score', 0):.2f}"
+            print(f"  [{i}] {row['resource']}  {score_str}  —  {row.get('rationale', '')}")
+        return
+
+    parts = rest.split(None, 1)
+    action = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if action in ("accept", "reject"):
+        try:
+            n = int(arg)
+        except ValueError:
+            print(f"usage: /suggest {action} <N>")
+            return
+        pending = store.list_pending()
+        if not pending:
+            print("  no pending suggestions")
+            return
+        if n < 1 or n > len(pending):
+            print(f"  invalid index {n}: {len(pending)} pending suggestion(s)")
+            return
+        row = pending[n - 1]
+        sid = row["suggestion_id"]
+
+        if action == "reject":
+            store.update_status(sid, REJECTED)
+            print(f"  [scout] rejected: {row['resource']}")
+        else:
+            # accept: shell into kent train run
+            store.update_status(sid, ACCEPTED)
+            resource = row["resource"]
+            print(f"  [scout] accepted: {resource}")
+            print(f"  launching: kent train run --resource {resource} --rounds 1 --runners 2")
+            print("  (configure a swap pair in ~/.kent/swap_pairs.toml if not done already)")
+            import subprocess, sys
+            result = subprocess.run(
+                [sys.executable, "-m", "agent.cli", "train", "run",
+                 "--resource", resource, "--rounds", "1", "--runners", "2"],
+                check=False,
+            )
+            if result.returncode == 0:
+                from .training.scout import record_pathway_for_suggestion
+                record_pathway_for_suggestion(sid, store=store)
+            else:
+                print(f"  [scout] training exited with code {result.returncode}")
+    else:
+        print("usage: /suggest | /suggest accept <N> | /suggest reject <N>")
 
 
 # ---------- subcommands ---------------------------------------------------- #
@@ -711,6 +781,20 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
 
     system_prompt = _build_system_prompt(memory_store)
 
+    # Scout: opt in via KENT_SCOUT_ENABLED=1
+    scout_enabled = os.environ.get("KENT_SCOUT_ENABLED", "").strip() in ("1", "true", "yes")
+    collector: Any = None
+    if scout_enabled:
+        try:
+            from .training.signal_collector import SignalCollector
+            collector = SignalCollector(
+                session_id=memory_store.session_id,
+                active_wing=memory_store.active_wing,
+                memory_store=memory_store,
+            )
+        except Exception:
+            pass
+
     # Use wake_up_full at session start: global + wing-scoped diary
     history: list[dict] = []
     recalled = memory_store.wake_up_full()
@@ -727,6 +811,17 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     print(_ui.field("Wing",    _ui.c(_ui.GOLD, memory_store.active_wing), label_width=7))
     print("  " + _ui.c(_ui.DIM, "Type your message. /help for slash commands. /exit to quit."))
     print(_ui.rule())
+
+    # Scout banner: show pending suggestions at session start (cron-mode users
+    # populate suggestions via `kent scout` without enabling live collection).
+    try:
+        from .training.scout import SuggestionStore
+        n_pending = SuggestionStore().count_pending()
+        if n_pending:
+            s = "s" if n_pending != 1 else ""
+            print(f"[scout] {n_pending} pending training suggestion{s} — /suggest to review")
+    except Exception:
+        pass
 
     while True:
         try:
@@ -751,11 +846,28 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
             history, _ = await _stream_one_turn(
                 registry, llm, history, user_input,
                 critic_llm=critic_llm, memory_store=memory_store,
-                system_prompt=system_prompt,
+                system_prompt=system_prompt, collector=collector,
             )
         except KeyboardInterrupt:
             print("\n" + _ui.info_line("interrupted", ""))
             continue
+
+        # Mid-chat prompt: one per session, score ≥ MID_CHAT_SCORE_THRESHOLD
+        if scout_enabled and collector is not None and not collector.mid_chat_fired:
+            try:
+                from .training.scout import analyze, MID_CHAT_SCORE_THRESHOLD
+                new_recs = analyze()
+                high = [r for r in new_recs if r.score >= MID_CHAT_SCORE_THRESHOLD]
+                if high:
+                    best = high[0]
+                    print(f"\n[scout] new suggestion: {best.resource} (score={best.score:.2f}) — /suggest to review")
+                    collector.mark_mid_chat_fired()
+            except Exception:
+                pass
+
+        # Keep collector's active wing in sync with the store
+        if collector is not None:
+            collector.update_wing(memory_store.active_wing)
 
 
 def cmd_repl(args: argparse.Namespace) -> int:
@@ -891,7 +1003,7 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_train(args: argparse.Namespace) -> int:
+def cmd_train_run(args: argparse.Namespace) -> int:
     """Run APO training for one resource across configured swap pairs."""
     import asyncio
     from .training import TrainingConfig
@@ -1089,6 +1201,7 @@ def cmd_train(args: argparse.Namespace) -> int:
                 f.write(
                     json.dumps(
                         {
+                            "ts": time.time(),
                             "resource": resource,
                             "pair": f"{pair.actor_model}+{pair.critic_model}",
                             **gate,
@@ -1147,6 +1260,99 @@ def cmd_train(args: argparse.Namespace) -> int:
                     + "\n"
                 )
 
+    return 0
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """Dispatch kent train subcommands: run | suggest | auto."""
+    train_command = getattr(args, "train_command", None)
+    if train_command == "run":
+        return cmd_train_run(args)
+    elif train_command == "suggest":
+        return cmd_train_suggest(args)
+    elif train_command == "auto":
+        return cmd_train_auto(args)
+    else:
+        print("usage: kent train {run,suggest,auto}", file=sys.stderr)
+        print("  run      --resource X [--pair A+C] [--rounds N] …  run APO training", file=sys.stderr)
+        print("  suggest  list pending training suggestions", file=sys.stderr)
+        print("  auto     --yes --suggestion-id ID  accept + train non-interactively", file=sys.stderr)
+        return 2
+
+
+def cmd_train_suggest(args: argparse.Namespace) -> int:
+    """List pending scout training suggestions."""
+    from .training.scout import SuggestionStore
+    store = SuggestionStore()
+    pending = store.list_pending()
+    if not pending:
+        print("no pending training suggestions")
+        return 0
+    for i, row in enumerate(pending, 1):
+        print(f"  [{i}] {row['resource']}  score={row.get('score', 0):.2f}  —  {row.get('rationale', '')}")
+    return 0
+
+
+def cmd_train_auto(args: argparse.Namespace) -> int:
+    """Accept a suggestion and run training non-interactively (requires --yes)."""
+    if not getattr(args, "yes", False):
+        print("--yes required to prevent accidental APO runs", file=sys.stderr)
+        return 2
+
+    suggestion_id = getattr(args, "suggestion_id", None)
+    if not suggestion_id:
+        print("--suggestion-id required", file=sys.stderr)
+        return 2
+
+    from .training.scout import SuggestionStore, ACCEPTED, PENDING
+    store = SuggestionStore()
+    row = store.get(suggestion_id)
+    if not row:
+        print(f"suggestion {suggestion_id!r} not found", file=sys.stderr)
+        return 2
+    if row.get("status") != PENDING:
+        print(f"suggestion {suggestion_id!r} is {row.get('status')!r}, not pending", file=sys.stderr)
+        return 2
+
+    resource = row["resource"]
+    store.update_status(suggestion_id, ACCEPTED)
+    print(f"[scout] accepted: {resource}")
+
+    # Build a synthetic namespace for cmd_train_run
+    fake = argparse.Namespace(
+        resource=resource,
+        pair=getattr(args, "pair", None),
+        sweep=False,
+        rounds=1,
+        runners=2,
+        train_size=10,
+        examples_dir=None,
+        skip_collusion_check=False,
+        apo_base_url=None,
+        gradient_model=None,
+        apply_edit_model=None,
+    )
+    rc = cmd_train_run(fake)
+    if rc == 0:
+        from .training.scout import record_pathway_for_suggestion
+        record_pathway_for_suggestion(suggestion_id, store=store)
+    return rc
+
+
+def cmd_scout(args: argparse.Namespace) -> int:
+    """Cron entrypoint: analyze signals, append new suggestions, print 1-line summary."""
+    from .training.scout import analyze
+    try:
+        recs = analyze()
+    except Exception as e:
+        print(f"scout: error during analysis: {e}", file=sys.stderr)
+        return 1
+    n = len(recs)
+    if n:
+        resources = ", ".join(r.resource for r in recs)
+        print(f"scout: {n} new — {resources}")
+    else:
+        print("scout: no new suggestions")
     return 0
 
 
@@ -1884,58 +2090,78 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_run.set_defaults(func=cmd_run)
 
-    # `kent train`
-    p_train = sub.add_parser("train", help="APO training: optimize a prompt resource")
-    p_train.add_argument(
+    # `kent train {run,suggest,auto}`
+    p_train = sub.add_parser("train", help="APO training subcommands: run | suggest | auto")
+    p_train.set_defaults(func=cmd_train, train_command=None)
+    train_sub = p_train.add_subparsers(dest="train_command")
+
+    # `kent train run --resource X …`  (replaces old flat `kent train --resource X`)
+    p_train_run = train_sub.add_parser("run", help="Run APO training for a prompt resource")
+    p_train_run.add_argument(
         "--resource",
         required=True,
         help="Resource to optimize (actor_system_prompt, retrieval_policy, ...)",
     )
-    p_train.add_argument(
+    p_train_run.add_argument(
         "--pair",
         default=None,
         metavar="ACTOR+CRITIC",
         help="Model pair: actor_model+critic_model (e.g. gpt-4o-mini+gpt-4o)",
     )
-    p_train.add_argument("--sweep", action="store_true", help="Run all pairs from swap_pairs.toml")
-    p_train.add_argument("--rounds", type=int, default=1, help="APO rounds (default: 1)")
-    p_train.add_argument("--runners", type=int, default=2, help="Parallel runners (default: 2)")
-    p_train.add_argument("--train-size", type=int, default=10, dest="train_size", help="Training examples (default: 10)")
-    p_train.add_argument(
+    p_train_run.add_argument("--sweep", action="store_true", help="Run all pairs from swap_pairs.toml")
+    p_train_run.add_argument("--rounds", type=int, default=1, help="APO rounds (default: 1)")
+    p_train_run.add_argument("--runners", type=int, default=2, help="Parallel runners (default: 2)")
+    p_train_run.add_argument("--train-size", type=int, default=10, dest="train_size", help="Training examples (default: 10)")
+    p_train_run.add_argument(
         "--examples-dir",
         default=None,
         dest="examples_dir",
         metavar="DIR",
-        help="Directory of *.jsonl files with real training examples (each line: {task_id, prompt, ...})",
+        help="Directory of *.jsonl files with real training examples",
     )
-    p_train.add_argument(
+    p_train_run.add_argument(
         "--skip-collusion-check",
         action="store_true",
         dest="skip_collusion_check",
-        help="Skip the mandatory collusion probe (NOT recommended; documented as mandatory in plan)",
+        help="Skip the mandatory collusion probe (NOT recommended)",
     )
-    p_train.add_argument(
+    p_train_run.add_argument(
         "--apo-base-url",
         default=None,
         dest="apo_base_url",
         metavar="URL",
-        help="Override OpenAI endpoint for APO (e.g. https://api.atlascloud.ai/v1 to run APO against an OpenAI-compatible alternative)",
+        help="Override OpenAI endpoint for APO",
     )
-    p_train.add_argument(
+    p_train_run.add_argument(
         "--gradient-model",
         default=None,
         dest="gradient_model",
         metavar="MODEL",
         help="Model APO uses for textual gradients (default: gpt-5-mini)",
     )
-    p_train.add_argument(
+    p_train_run.add_argument(
         "--apply-edit-model",
         default=None,
         dest="apply_edit_model",
         metavar="MODEL",
         help="Model APO uses for applying edits (default: gpt-4.1-mini)",
     )
-    p_train.set_defaults(func=cmd_train)
+    p_train_run.set_defaults(func=cmd_train, train_command="run")
+
+    # `kent train suggest`
+    p_train_suggest = train_sub.add_parser("suggest", help="List pending scout suggestions")
+    p_train_suggest.set_defaults(func=cmd_train, train_command="suggest")
+
+    # `kent train auto --yes --suggestion-id ID`
+    p_train_auto = train_sub.add_parser("auto", help="Accept + run a suggestion non-interactively")
+    p_train_auto.add_argument("--yes", action="store_true", help="Required: confirm the training run")
+    p_train_auto.add_argument("--suggestion-id", dest="suggestion_id", required=True, help="ID from train suggest")
+    p_train_auto.add_argument("--pair", default=None, metavar="ACTOR+CRITIC")
+    p_train_auto.set_defaults(func=cmd_train, train_command="auto")
+
+    # `kent scout`  (cron entrypoint)
+    p_scout = sub.add_parser("scout", help="Analyze signals and surface training suggestions (cron-safe)")
+    p_scout.set_defaults(func=cmd_scout)
 
     # `kent wake-up`
     p_wake = sub.add_parser("wake-up", help="Run memory recall self-improvement games")
