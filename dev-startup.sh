@@ -219,6 +219,54 @@ PY
 )"
 boot_line "creds" "synced ${C_BOLD}${KEY_COUNT}${C_RESET} key(s) → ~/.kent/credentials.json" "$C_GREEN"
 
+# ---------- 3b. detect WSL & record shell defaults ----------------------- #
+# If we're running inside WSL, or if wsl.exe is reachable from this shell
+# (Windows + Git-Bash style invocation), record it under cfg["shell"] so the
+# agent's Shell tool can default its WSLExecutor to the right distro/user.
+
+WSL_AVAILABLE="0"
+WSL_DEFAULT_DISTRO=""
+WSL_DEFAULT_USER=""
+
+if [ -n "${WSL_DISTRO_NAME:-}" ]; then
+    WSL_AVAILABLE="1"
+    WSL_DEFAULT_DISTRO="$WSL_DISTRO_NAME"
+    WSL_DEFAULT_USER="${USER:-}"
+elif grep -qi microsoft /proc/version 2>/dev/null; then
+    WSL_AVAILABLE="1"
+    WSL_DEFAULT_USER="${USER:-}"
+elif command -v wsl.exe >/dev/null 2>&1; then
+    WSL_AVAILABLE="1"
+    # `wsl.exe -l -q` lists distros (one per line, UTF-16 on older Windows).
+    # Strip nulls + CRs to coerce to plain ASCII; first non-empty line wins.
+    WSL_DEFAULT_DISTRO="$(wsl.exe -l -q 2>/dev/null \
+        | tr -d '\000\r' \
+        | awk 'NF{print; exit}')"
+fi
+
+if [ "$WSL_AVAILABLE" = "1" ]; then
+    uv run --quiet python - "$KENT_HOME/config.json" "$WSL_DEFAULT_DISTRO" "$WSL_DEFAULT_USER" <<'PY'
+import json, os, sys
+p, distro, user = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = json.loads(open(p).read()) if os.path.exists(p) else {}
+except Exception:
+    cfg = {}
+shell = cfg.get("shell") or {}
+shell["wsl_available"] = True
+if distro:
+    shell["default_distro"] = distro
+if user:
+    shell["default_user"] = user
+cfg["shell"] = shell
+os.makedirs(os.path.dirname(p), exist_ok=True)
+open(p, "w").write(json.dumps(cfg, indent=2))
+PY
+    boot_line "wsl  " "detected — distro=${C_BOLD}${WSL_DEFAULT_DISTRO:-<unknown>}${C_RESET} user=${C_BOLD}${WSL_DEFAULT_USER:-<unset>}${C_RESET}" "$C_GREEN"
+else
+    boot_line "wsl  " "${C_DIM}not detected — shell tool will use host default${C_RESET}" "$C_GOLD"
+fi
+
 # ---------- 4. launch viz (background) ----------------------------------- #
 
 if [ "${KENT_NO_VIZ:-0}" = "1" ]; then

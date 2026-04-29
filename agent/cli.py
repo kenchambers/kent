@@ -31,6 +31,7 @@ from typing import Any, TYPE_CHECKING
 
 from . import _ui
 from .builtin.shell import Shell, detect_shell_backend
+from .builtin._executors import WSLExecutor, default_executor
 from .builtin.spawn import Spawn
 from .builtin.web_fetch import WebFetch
 from .builtin.web_search import WebSearch
@@ -92,7 +93,18 @@ SYSTEM_PROMPT = _SYSTEM_PROMPT_BASE
 
 def _build_system_prompt(memory_store: "MemoryStore | None" = None) -> str:
     """Build the system prompt, optionally appending current wings list."""
-    base = _SYSTEM_PROMPT_BASE
+    backend_line = ""
+    try:
+        backend_label = _build_shell_executor().label
+        backend_line = (
+            f"\n\nActive shell backend: {backend_label}. "
+            "The 'distro'/'user' shell args only apply on Windows+WSL; "
+            "leave them unset elsewhere."
+        )
+    except Exception:
+        pass
+
+    base = _SYSTEM_PROMPT_BASE + backend_line
     if memory_store is None:
         return base
     try:
@@ -335,11 +347,22 @@ def gather_startup_choice(*, save: bool = True) -> StartupChoice:
 
 # ---------- registry / runtime -------------------------------------------- #
 
+def _build_shell_executor():
+    """Pick a shell executor, honoring cfg["shell"] if dev-startup.sh recorded WSL."""
+    shell_cfg = (load_config().get("shell") or {})
+    if shell_cfg.get("wsl_available") and platform.system() == "Windows":
+        return WSLExecutor(
+            distro=shell_cfg.get("default_distro"),
+            user=shell_cfg.get("default_user"),
+        )
+    return default_executor()
+
+
 def build_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(WebSearch())
     registry.register(WebFetch())
-    registry.register(Shell())
+    registry.register(Shell(executor=_build_shell_executor()))
     return registry
 
 

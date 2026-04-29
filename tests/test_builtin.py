@@ -9,6 +9,12 @@ from agent.builtin.shell import (
     detect_shell_backend,
     _truncate,
 )
+from agent.builtin._executors import (
+    BashExecutor,
+    ElevatedExecutor,
+    PowerShellExecutor,
+    WSLExecutor,
+)
 from agent.builtin.web_fetch import _validate_url, _to_markdown
 from agent.builtin.web_search import _parse_results, _unwrap_ddg_redirect
 from agent.cli import (
@@ -214,3 +220,66 @@ async def test_shell_times_out():
     )
     assert result.is_error
     assert "timed out" in result.output
+
+
+# ---------- executor argv shape ------------------------------------------- #
+# These are pure-function tests — no host or subprocess needed, so they run
+# uniformly on every platform.
+
+def test_bash_executor_argv():
+    ex = BashExecutor()
+    assert ex.build_argv("ls -la") == ["/bin/bash", "-lc", "ls -la"]
+
+
+def test_powershell_executor_argv():
+    ex = PowerShellExecutor()
+    assert ex.build_argv("Get-Process") == [
+        "powershell.exe", "-NoProfile", "-Command", "Get-Process"
+    ]
+
+
+def test_wsl_executor_argv_minimal():
+    ex = WSLExecutor()
+    assert ex.build_argv("uname -a") == ["wsl.exe", "--", "bash", "-lc", "uname -a"]
+    assert ex.label == "wsl.exe → bash"
+
+
+def test_wsl_executor_argv_with_distro_and_user():
+    ex = WSLExecutor(distro="Ubuntu-22.04", user="root")
+    # -d before -u before -- before bash -lc
+    assert ex.build_argv("whoami") == [
+        "wsl.exe", "-d", "Ubuntu-22.04", "-u", "root", "--", "bash", "-lc", "whoami"
+    ]
+    assert "Ubuntu-22.04" in ex.label
+    assert "root" in ex.label
+
+
+def test_elevated_executor_posix_prepends_sudo():
+    # Force POSIX path regardless of host: WSLExecutor on POSIX is unusual but
+    # it's a pure-function test — only argv shape matters here.
+    inner = BashExecutor()
+    wrapped = ElevatedExecutor(inner)
+    if platform.system() == "Windows":
+        pytest.skip("POSIX sudo path only")
+    argv = wrapped.build_argv("id -u")
+    assert argv[:2] == ["sudo", "-n"]
+    assert argv[2:] == ["/bin/bash", "-lc", "id -u"]
+    assert wrapped.label.startswith("elevated[")
+
+
+def test_elevated_executor_rejects_double_wrap():
+    inner = ElevatedExecutor(BashExecutor())
+    with pytest.raises(ValueError):
+        ElevatedExecutor(inner)
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="non-Windows behavior only")
+@pytest.mark.asyncio
+async def test_shell_warns_when_distro_ignored_on_non_wsl():
+    sh = Shell()
+    result = await sh.call(
+        ShellArgs(command="echo ok", distro="Ubuntu", user="root"), ToolContext()
+    )
+    assert isinstance(result.output, dict)
+    assert "warnings" in result.output
+    assert any("distro/user ignored" in w for w in result.output["warnings"])
