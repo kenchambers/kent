@@ -1416,11 +1416,29 @@ def _load_gateway_settings(args: argparse.Namespace) -> "Any":
     status = getattr(args, "status", None) or block.get("status", "online")
     activity = getattr(args, "activity", None) or block.get("activity", "thinking")
     log_file_str = getattr(args, "log_file", None) or str(CONFIG_DIR / "gateway.log")
+    heartbeat_interval = (
+        os.environ.get("KENT_HEARTBEAT_INTERVAL")
+        or getattr(args, "heartbeat_interval", None)
+        or block.get("heartbeat_interval")
+    )
+    heartbeat_channel_id_raw = (
+        os.environ.get("KENT_HEARTBEAT_CHANNEL_ID")
+        or getattr(args, "heartbeat_channel_id", None)
+        or block.get("heartbeat_channel_id")
+    )
+    heartbeat_channel_id: int | None = None
+    if heartbeat_channel_id_raw is not None:
+        try:
+            heartbeat_channel_id = int(heartbeat_channel_id_raw)
+        except (ValueError, TypeError):
+            pass
     return DiscordSettings(
         mention_only=mention_only,
         status=status,
         activity=activity,
         log_file=Path(log_file_str),
+        heartbeat_interval=heartbeat_interval,
+        heartbeat_channel_id=heartbeat_channel_id,
     )
 
 
@@ -1524,6 +1542,12 @@ def _build_run_argv(args: argparse.Namespace) -> list[str]:
     wing = getattr(args, "wing", None)
     if wing:
         argv += ["--wing", wing]
+    heartbeat_interval = getattr(args, "heartbeat_interval", None)
+    if heartbeat_interval:
+        argv += ["--heartbeat-interval", heartbeat_interval]
+    heartbeat_channel_id = getattr(args, "heartbeat_channel_id", None)
+    if heartbeat_channel_id:
+        argv += ["--heartbeat-channel-id", str(heartbeat_channel_id)]
     return argv
 
 
@@ -1605,6 +1629,10 @@ def cmd_gateway_status(_args: argparse.Namespace) -> int:
         print(f"  channels: {channels}")
     if ready_at:
         print(f"  ready at: {ready_at}")
+    last_hb = status.get("last_heartbeat_at")
+    if last_hb:
+        hb_status = status.get("last_heartbeat_status", "")
+        print(f"  last hb : {last_hb}  [{hb_status}]")
     print(f"  pid file: {lc.pid_path()}")
     print(f"  log     : {log_path}")
     return 0
@@ -1649,6 +1677,12 @@ def cmd_gateway_config(args: argparse.Namespace) -> int:
     if getattr(args, "activity", None):
         block["activity"] = args.activity
         changed = True
+    if getattr(args, "heartbeat_interval", None):
+        block["heartbeat_interval"] = args.heartbeat_interval
+        changed = True
+    if getattr(args, "heartbeat_channel_id", None):
+        block["heartbeat_channel_id"] = args.heartbeat_channel_id
+        changed = True
     if changed:
         cfg["gateway"] = block
         save_config(cfg)
@@ -1671,12 +1705,96 @@ def cmd_gateway_config(args: argparse.Namespace) -> int:
 
     print()
     print("[gateway settings]")
-    print(f"  mention_only : {block.get('mention_only', True)}")
-    print(f"  status       : {block.get('status', 'online')}")
-    print(f"  activity     : {block.get('activity', 'thinking')}")
-    creds = load_credentials()
+    print(f"  mention_only      : {block.get('mention_only', True)}")
+    print(f"  status            : {block.get('status', 'online')}")
+    print(f"  activity          : {block.get('activity', 'thinking')}")
+    print(f"  heartbeat_interval: {block.get('heartbeat_interval', '<unset>')}")
+    print(f"  heartbeat_channel : {block.get('heartbeat_channel_id', '<unset>')}")
     has_token = bool(_resolve_discord_token())
-    print(f"  token        : {'set' if has_token else '<unset — run `kent gateway config`>'}")
+    print(f"  token             : {'set' if has_token else '<unset — run `kent gateway config`>'}")
+    return 0
+
+
+def cmd_gateway_test(args: argparse.Namespace) -> int:
+    """End-to-end Discord smoke test: connect, verify identity, optionally
+    verify a target channel is reachable + sendable. Exits 0 on success.
+    """
+    token = _resolve_discord_token()
+    if not token:
+        print("no Discord bot token. Run `kent gateway config`.", file=sys.stderr)
+        return 2
+
+    try:
+        import discord  # type: ignore[import-not-found]
+    except ImportError:
+        print("discord.py not installed. Run: uv pip install 'discord.py>=2.4'",
+              file=sys.stderr)
+        return 2
+
+    cfg = load_config()
+    block = cfg.get("gateway") or {}
+    channel_id = getattr(args, "heartbeat_channel_id", None) or block.get(
+        "heartbeat_channel_id"
+    )
+    try:
+        channel_id_int = int(channel_id) if channel_id else None
+    except (TypeError, ValueError):
+        channel_id_int = None
+    do_send = bool(getattr(args, "send", False))
+    timeout_s = float(getattr(args, "timeout", 20.0) or 20.0)
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+
+    client = discord.Client(intents=intents)
+    result: dict[str, Any] = {"ok": False}
+
+    async def on_ready() -> None:
+        try:
+            user = client.user
+            result["user"] = f"{user} (id={user.id})" if user is not None else None
+            print(f"  ✓ connected as {result['user']}")
+
+            if channel_id_int is not None:
+                try:
+                    ch = client.get_channel(channel_id_int) or await client.fetch_channel(
+                        channel_id_int
+                    )
+                    result["channel"] = f"{getattr(ch, 'name', '?')} (id={channel_id_int})"
+                    print(f"  ✓ channel reachable: {result['channel']}")
+                except Exception as e:
+                    result["error"] = f"channel {channel_id_int} not accessible: {e}"
+                    return
+                if do_send:
+                    import uuid as _uuid
+                    marker = f"kent-online-check {_uuid.uuid4().hex[:8]}"
+                    try:
+                        sent = await ch.send(marker)
+                        assert sent.id
+                        print(f"  ✓ posted marker to channel ({marker})")
+                    except Exception as e:
+                        result["error"] = f"could not send to channel: {e}"
+                        return
+            result["ok"] = True
+        finally:
+            await client.close()
+
+    client.event(on_ready)
+
+    try:
+        asyncio.run(asyncio.wait_for(client.start(token), timeout=timeout_s))
+    except asyncio.TimeoutError:
+        print(f"  ✗ login timeout (>{timeout_s:.0f}s) — token invalid or network blocked",
+              file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"  ✗ login failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    if not result.get("ok"):
+        print(f"  ✗ {result.get('error', 'unknown failure')}", file=sys.stderr)
+        return 1
+    print("[gateway test] all checks passed")
     return 0
 
 
@@ -1687,6 +1805,7 @@ _GATEWAY_DISPATCH = {
     "restart": cmd_gateway_restart,
     "status": cmd_gateway_status,
     "config": cmd_gateway_config,
+    "test": cmd_gateway_test,
 }
 
 
@@ -1867,7 +1986,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "action",
         nargs="?",
         default="start",
-        choices=["run", "start", "stop", "restart", "status", "config"],
+        choices=["run", "start", "stop", "restart", "status", "config", "test"],
         help="What to do (default: start)",
     )
     p_gateway.add_argument(
@@ -1920,6 +2039,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Force every Discord channel to use this wing (overrides per-channel naming)",
     )
     p_gateway.add_argument(
+        "--heartbeat-interval",
+        dest="heartbeat_interval",
+        default=None,
+        metavar="INTERVAL",
+        help="Heartbeat cadence (e.g. '30s', '5m', '30m', '1h', 'off')",
+    )
+    p_gateway.add_argument(
+        "--heartbeat-channel-id",
+        dest="heartbeat_channel_id",
+        default=None,
+        type=int,
+        metavar="CHANNEL_ID",
+        help="Discord channel ID the heartbeat agent runs against",
+    )
+    p_gateway.add_argument(
         "--token",
         action="store_true",
         help="(config only) Prompt for and save a Discord bot token",
@@ -1933,6 +2067,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--show",
         action="store_true",
         help="(config only) Show current settings without prompting for a token",
+    )
+    p_gateway.add_argument(
+        "--send",
+        action="store_true",
+        help="(test only) Post a one-line marker to the configured channel",
+    )
+    p_gateway.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        metavar="SECS",
+        help="(test only) Login timeout in seconds (default: 20)",
     )
     p_gateway.set_defaults(func=cmd_gateway)
 

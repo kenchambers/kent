@@ -16,6 +16,7 @@ The Python package is imported as `agent`; the installed CLI binary is `kent`.
   - [3. One-shot mode](#3-one-shot-mode)
   - [4. Open the live 3D palace viewer + chat](#4-open-the-live-3d-palace-viewer--chat)
   - [5. Talk to kent on Discord](#5-talk-to-kent-on-discord)
+  - [6. Heartbeat: scheduled agent check-ins](#6-heartbeat-scheduled-agent-check-ins)
 - [CLI reference](#cli-reference)
   - [`kent`](#kent-1)
   - [`kent run`](#kent-run)
@@ -231,11 +232,38 @@ kent can also live on Discord as a bot — read messages, reply, react, manage t
 
 ```bash
 kent gateway config             # paste your bot token (see docs/gateway.md for app setup)
+kent gateway test --send        # smoke test: connect, verify channel, post one marker
 kent gateway start              # detach the daemon
 kent gateway status             # is it running? where's the log?
 ```
 
 See [docs/gateway.md](docs/gateway.md) for the full Discord application walkthrough (creating the app, enabling intents, generating an invite URL).
+
+### 6. Heartbeat: scheduled agent check-ins
+
+The gateway can fire a periodic, agent-driven "heartbeat" turn on a configurable cadence — kent stays alive between user mentions instead of sitting idle. Each tick reads `~/.kent/HEARTBEAT.md` (free-form Markdown you control), runs one full agent turn with that file as the prompt, and lets the agent decide whether to post via `discord_send`, write a diary entry, run a search, etc.
+
+```bash
+# Configure interval + channel (or let dev-startup.sh prompt you on first run)
+kent gateway config --heartbeat-interval 30m --heartbeat-channel-id 1234567890
+
+# Edit what kent does each tick
+$EDITOR ~/.kent/HEARTBEAT.md
+
+# Confirm it ran
+kent gateway status            # shows last_heartbeat_at / last_heartbeat_status
+```
+
+Accepted intervals: `30s`, `5m`, `30m`, `1h`, etc. Set to `off` (or leave unset) to disable. The file is re-read every tick, so you can edit `HEARTBEAT.md` live and the next tick picks up the new instructions without a restart.
+
+`dev-startup.sh` will:
+
+1. Prompt for an interval (default `30m`) and a Discord channel id on first run, persisting both to `~/.kent/config.json`.
+2. Seed `~/.kent/HEARTBEAT.md` with a starter template if the file is missing.
+3. Run `kent gateway test --send` as a connectivity smoke test — token, intents, channel access, and send permission — *before* spawning the long-lived gateway.
+4. Spawn the gateway and poll `gateway.status.json` until `on_ready` fires (up to 20s) so token errors surface immediately instead of hiding in `gateway.log`.
+
+Skip the prompt with `KENT_NO_HEARTBEAT=1`; skip the smoke test with `KENT_NO_GATEWAY_TEST=1`; skip the gateway entirely with `KENT_NO_GATEWAY=1`.
 
 ## CLI reference
 
@@ -274,7 +302,7 @@ Exits 0 on Ctrl-C, 1 if `mempalace` isn't importable, 2 if chat is enabled but n
 ### `kent gateway`
 
 ```
-kent gateway [run|start|stop|restart|status|config] [flags]
+kent gateway [run|start|stop|restart|status|config|test] [flags]
 ```
 
 Runs kent as a Discord bot. Each channel/DM maps to its own memory wing (`discord_<guild_id>_<channel_id>` or `discord_dm_<user_id>`). Discord tools (`discord_send`, `discord_react`, `discord_thread_create`, `discord_set_status`, `discord_read_history`) are registered into the bot's tool registry — they are *not* available in the local REPL or `kent run`.
@@ -285,21 +313,31 @@ Runs kent as a Discord bot. Each channel/DM maps to its own memory wing (`discor
 | `start`    | Detach a daemon child; write `~/.kent/gateway.pid`        |
 | `stop`     | SIGTERM the pid (await 10s), SIGKILL on timeout, clear pid |
 | `restart`  | `stop` then `start`                                       |
-| `status`   | Print pid, uptime, channel count, ready timestamp, log path |
+| `status`   | Print pid, uptime, channel count, ready timestamp, last heartbeat, log path |
 | `config`   | Prompt for bot token (chmod 0600), edit gateway defaults  |
+| `test`     | Connectivity smoke test: login, verify channel, optional `--send` marker |
 
 Flags for `run` / `start` / `restart`:
 
-| Flag             | Default              | What it does                                                |
-|------------------|----------------------|-------------------------------------------------------------|
-| `--mention-only` | on                   | Only respond when @-mentioned                               |
-| `--all-messages` | off                  | Respond to every message in visible channels                |
-| `--status`       | `online`             | Initial presence: `online`/`idle`/`dnd`/`invisible`         |
-| `--activity`     | `thinking`           | "Playing X" / "Watching X" string                           |
-| `--log-file`     | `~/.kent/gateway.log`| Where the detached process writes stdout/stderr             |
-| `--service`      | (saved config)       | Override LLM service (e.g. `atlascloud`) for this run       |
-| `--model`        | (saved config)       | Override model id for this run                              |
-| `--wing`         | (per-channel auto)   | Pin every channel/DM to a single wing (overrides per-channel naming) |
+| Flag                       | Default              | What it does                                                |
+|----------------------------|----------------------|-------------------------------------------------------------|
+| `--mention-only`           | on                   | Only respond when @-mentioned                               |
+| `--all-messages`           | off                  | Respond to every message in visible channels                |
+| `--status`                 | `online`             | Initial presence: `online`/`idle`/`dnd`/`invisible`         |
+| `--activity`               | `thinking`           | "Playing X" / "Watching X" string                           |
+| `--log-file`               | `~/.kent/gateway.log`| Where the detached process writes stdout/stderr             |
+| `--service`                | (saved config)       | Override LLM service (e.g. `atlascloud`) for this run       |
+| `--model`                  | (saved config)       | Override model id for this run                              |
+| `--wing`                   | (per-channel auto)   | Pin every channel/DM to a single wing (overrides per-channel naming) |
+| `--heartbeat-interval`     | (saved config)       | Heartbeat cadence: `30s`/`5m`/`30m`/`1h`/`off`              |
+| `--heartbeat-channel-id`   | (saved config)       | Channel ID the heartbeat agent runs against                 |
+
+Flags for `test`:
+
+| Flag         | Default | What it does                                                |
+|--------------|---------|-------------------------------------------------------------|
+| `--send`     | off     | After connecting, post a one-line marker to the configured heartbeat channel and verify it landed |
+| `--timeout`  | `20`    | Seconds to wait for `on_ready` before failing               |
 
 Status side-files: `~/.kent/gateway.pid` is written at start; `~/.kent/gateway.status.json` is updated on connect and per new channel session — both are removed on `kent gateway stop`.
 
@@ -395,8 +433,9 @@ Files live under `~/.kent/` (override with `KENT_HOME=/some/path`):
 | `~/.kent/diaries/<wing>/.intent.txt` | One-line wing description             | Written at wing creation |
 | `~/.kent/diaries/<wing>/YYYY-MM-DD.md` | Daily diary entries               | Append-only; ingested into palace |
 | `~/.kent/gateway.pid`                | PID of the running gateway daemon     | Written by `kent gateway start`; cleared by `stop` |
-| `~/.kent/gateway.status.json`        | Live snapshot: connected user, channel count, ready timestamp | Updated by the daemon on connect + each new channel session; cleared by `stop` |
+| `~/.kent/gateway.status.json`        | Live snapshot: connected user, channel count, ready timestamp, `last_heartbeat_at` | Updated by the daemon on connect + each new channel session + every heartbeat tick; cleared by `stop` |
 | `~/.kent/gateway.log`                | Gateway stdout/stderr                 | Append-only; rotates on `dev-startup.sh` boot |
+| `~/.kent/HEARTBEAT.md`               | Free-form prompt fed to the agent on every heartbeat tick | Seeded by `dev-startup.sh` on first run; edit live to change behavior |
 
 Override with environment:
 
@@ -407,6 +446,10 @@ Override with environment:
 | `ATLASCLOUD_API_KEY`   | Atlas Cloud API key — wins over saved credential             |
 | `KENT_DISCORD_BOT_TOKEN` | Discord bot token — wins over saved credential             |
 | `KENT_NO_GATEWAY=1`    | Skip launching the Discord gateway in `dev-startup.sh`       |
+| `KENT_NO_GATEWAY_TEST=1` | Skip the pre-spawn Discord connectivity smoke test         |
+| `KENT_NO_HEARTBEAT=1`  | Skip the heartbeat config prompt in `dev-startup.sh`         |
+| `KENT_HEARTBEAT_INTERVAL` | Override the saved heartbeat cadence for one gateway run  |
+| `KENT_HEARTBEAT_CHANNEL_ID` | Override the saved heartbeat channel id for one run     |
 
 ## Library use
 

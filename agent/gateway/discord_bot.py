@@ -41,6 +41,8 @@ class DiscordSettings:
     status: str = "online"
     activity: str | None = "thinking"
     log_file: Path | None = None
+    heartbeat_interval: str | None = None   # "30m", "off", or None (= off)
+    heartbeat_channel_id: int | None = None  # channel the heartbeat runs against
 
 
 @dataclass
@@ -158,6 +160,7 @@ class DiscordGateway:
         self._sessions_lock = asyncio.Lock()
         self._llm = llm_factory()
         self._ready_at: str | None = None
+        self._heartbeat: "Any" = None  # Heartbeat | None
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -198,6 +201,7 @@ class DiscordGateway:
         if self._ready_at is None:
             self._ready_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._write_status_snapshot()
+        self._start_heartbeat()
 
     def _write_status_snapshot(self) -> None:
         user = getattr(self._bot, "user", None)
@@ -212,13 +216,14 @@ class DiscordGateway:
             }
         )
 
-    async def _session_for(self, message: Any) -> ChannelSession:
-        cid = int(message.channel.id)
+    async def _session_for_channel_id(
+        self, cid: int, wing_name: str | None = None
+    ) -> ChannelSession:
         async with self._sessions_lock:
             sess = self._sessions.get(cid)
             if sess is not None:
                 return sess
-            wing = self._wing_override or _wing_for_channel(message)
+            wing = self._wing_override or wing_name or f"discord_channel_{cid}"
             store = self._store_factory()
             try:
                 store.set_active_wing(wing)
@@ -231,6 +236,11 @@ class DiscordGateway:
             self._sessions[cid] = sess
             self._write_status_snapshot()
             return sess
+
+    async def _session_for(self, message: Any) -> ChannelSession:
+        cid = int(message.channel.id)
+        wing_name = _wing_for_channel(message)
+        return await self._session_for_channel_id(cid, wing_name=wing_name)
 
     def _should_respond(self, message: Any) -> bool:
         if message.author.id == self._bot.user.id:
@@ -304,10 +314,61 @@ class DiscordGateway:
                         logger.exception("final reply send failed")
                         break
 
+    def _start_heartbeat(self) -> None:
+        from .heartbeat import Heartbeat, parse_interval
+        interval_str = self._settings.heartbeat_interval or ""
+        interval_s = parse_interval(interval_str)
+        cid = self._settings.heartbeat_channel_id
+        if interval_s and interval_s > 0 and cid:
+            logger.info(
+                "heartbeat enabled: interval=%.0fs channel=%d", interval_s, cid
+            )
+            hb = Heartbeat(
+                gateway=self,
+                interval_s=interval_s,
+                channel_id=cid,
+            )
+            self._heartbeat = hb.start()
+        else:
+            logger.debug("heartbeat disabled (interval=%r channel=%r)", interval_str, cid)
+
+    async def _run_heartbeat_turn(self, channel_id: int, prompt_text: str) -> None:
+        session = await self._session_for_channel_id(channel_id)
+        assert session.store is not None and session.registry is not None
+        system_prompt = self._system_prompt_factory(session.store) + "\n\n" + DISCORD_SUFFIX
+        history = [*session.history, {"role": "user", "content": prompt_text}]
+        new_messages: list[dict] = []
+
+        async with session.lock:
+            try:
+                async for ev in agent_run(
+                    messages=history,
+                    tools=session.registry,
+                    llm=self._llm,
+                    system=system_prompt,
+                    max_turns=15,
+                    memory_store=session.store,
+                ):
+                    if isinstance(ev, AssistantMessageComplete):
+                        new_messages.append(ev.message.to_openai_dict())
+                    elif isinstance(ev, Terminal):
+                        break
+            except Exception:
+                logger.exception("heartbeat agent run failed")
+                return
+
+        session.history = [*history, *new_messages]
+
     async def start(self) -> None:
         await self._bot.start(self._token)
 
     async def close(self) -> None:
+        if self._heartbeat is not None:
+            self._heartbeat.cancel()
+            try:
+                await self._heartbeat
+            except (asyncio.CancelledError, Exception):
+                pass
         await self._bot.close()
 
 

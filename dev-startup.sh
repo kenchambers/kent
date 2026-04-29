@@ -258,11 +258,12 @@ else
     fi
 fi
 
-# ---------- 4b. launch gateway (background, optional) -------------------- #
+# ---------- 4b. discover token + heartbeat config (first-run prompt) ----- #
 
-if [ "${KENT_NO_GATEWAY:-0}" = "1" ]; then
-    boot_line "gw   " "${C_DIM}skipped (KENT_NO_GATEWAY=1)${C_RESET}" "$C_GOLD"
-else
+HEARTBEAT_MD="$KENT_HOME/HEARTBEAT.md"
+HAS_TOKEN="0"
+
+if [ "${KENT_NO_GATEWAY:-0}" != "1" ]; then
     HAS_TOKEN="$(uv run --quiet python - "$CREDS_DEST" <<'PY'
 import json, os, sys
 dest = sys.argv[1]
@@ -275,14 +276,156 @@ except Exception:
     print("0")
 PY
 )"
-    if [ "$HAS_TOKEN" = "1" ]; then
-        boot_line "gw   " "spawning Discord gateway"
-        : > "$GATEWAY_LOG"
-        ( uv run --quiet kent gateway run >> "$GATEWAY_LOG" 2>&1 ) &
-        GATEWAY_PID=$!
-        boot_line "gw   " "spawned (pid ${C_BOLD}${GATEWAY_PID}${C_RESET}) — log: ${C_BOLD}${GATEWAY_LOG}${C_RESET}" "$C_GREEN"
+fi
+
+if [ "${KENT_NO_HEARTBEAT:-0}" != "1" ] && [ "$HAS_TOKEN" = "1" ]; then
+    HB_ALREADY_SET="$(uv run --quiet python - "$KENT_HOME/config.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    cfg = json.loads(open(p).read())
+    val = (cfg.get("gateway") or {}).get("heartbeat_interval")
+    print("1" if val is not None else "0")
+except Exception:
+    print("0")
+PY
+)"
+    if [ "$HB_ALREADY_SET" = "0" ]; then
+        printf "  How often should the heartbeat tick? (30s/5m/30m/1h/off, default 30m): "
+        read -r HB_INTERVAL || HB_INTERVAL=""
+        HB_INTERVAL="${HB_INTERVAL:-30m}"
+
+        HB_CHANNEL_ID=""
+        if [ "$HB_INTERVAL" != "off" ]; then
+            printf "  Heartbeat Discord channel id (numeric, blank = skip): "
+            read -r HB_CHANNEL_ID || HB_CHANNEL_ID=""
+        fi
+
+        uv run --quiet python - "$KENT_HOME/config.json" "$HB_INTERVAL" "$HB_CHANNEL_ID" <<'PY'
+import json, sys, os
+p, interval, channel = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = json.loads(open(p).read()) if os.path.exists(p) else {}
+except Exception:
+    cfg = {}
+block = cfg.get("gateway") or {}
+block["heartbeat_interval"] = interval
+if channel:
+    try:
+        block["heartbeat_channel_id"] = int(channel)
+    except ValueError:
+        pass
+cfg["gateway"] = block
+open(p, "w").write(json.dumps(cfg, indent=2))
+PY
+        boot_line "hb   " "heartbeat configured: interval=${HB_INTERVAL} channel=${HB_CHANNEL_ID:-<none>}" "$C_GREEN"
+    fi
+
+    if [ ! -f "$HEARTBEAT_MD" ]; then
+        uv run --quiet python -c "
+from agent.gateway.heartbeat import default_heartbeat_md_text
+import pathlib
+p = pathlib.Path('$HEARTBEAT_MD')
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(default_heartbeat_md_text())
+"
+        boot_line "hb   " "seeded ${C_BOLD}${HEARTBEAT_MD}${C_RESET}" "$C_GREEN"
+    fi
+
+    HB_CURRENT="$(uv run --quiet python - "$KENT_HOME/config.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    block = (json.loads(open(p).read()).get("gateway") or {})
+    interval = block.get("heartbeat_interval") or "<unset>"
+    channel = block.get("heartbeat_channel_id") or "<unset>"
+    print(f"{interval}|{channel}")
+except Exception:
+    print("<unset>|<unset>")
+PY
+)"
+    HB_INTERVAL_NOW="${HB_CURRENT%%|*}"
+    HB_CHANNEL_NOW="${HB_CURRENT##*|}"
+    boot_line "hb   " "tick=${C_BOLD}${HB_INTERVAL_NOW}${C_RESET} channel=${C_BOLD}${HB_CHANNEL_NOW}${C_RESET} file=${C_BOLD}${HEARTBEAT_MD}${C_RESET}" "$C_GREEN"
+fi
+
+# ---------- 4c. discord e2e smoke test ------------------------------------ #
+# Validates: token works, intents wired, channel reachable, send permission.
+# Runs *before* the long-lived gateway spawn so token/permission errors
+# surface immediately instead of hiding in gateway.log.
+
+GW_TEST_OK="0"
+if [ "${KENT_NO_GATEWAY_TEST:-0}" = "1" ] || [ "$HAS_TOKEN" != "1" ]; then
+    : # skip
+else
+    boot_line "gwtst" "running Discord connectivity smoke test"
+    if uv run --quiet kent gateway test --send >/tmp/kent-gwtest.$$ 2>&1; then
+        GW_TEST_OK="1"
+        # Show key lines from the test output (✓ marks)
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            printf "       ${C_DIM}%s${C_RESET}\n" "$line"
+        done < /tmp/kent-gwtest.$$
+        boot_line "gwtst" "${C_BOLD}all checks passed${C_RESET}" "$C_GREEN"
     else
-        boot_line "gw   " "${C_DIM}disabled (no token — run \`kent gateway config\`)${C_RESET}" "$C_GOLD"
+        boot_line "gwtst" "${C_RED}failed${C_RESET} — see output below" "$C_RED"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            printf "       ${C_DIM}%s${C_RESET}\n" "$line"
+        done < /tmp/kent-gwtest.$$
+        printf "       ${C_GOLD}fix the issue (token / channel / perms) and re-run dev-startup.sh${C_RESET}\n"
+    fi
+    rm -f /tmp/kent-gwtest.$$
+fi
+
+# ---------- 4d. launch gateway (background, optional) -------------------- #
+
+if [ "${KENT_NO_GATEWAY:-0}" = "1" ]; then
+    boot_line "gw   " "${C_DIM}skipped (KENT_NO_GATEWAY=1)${C_RESET}" "$C_GOLD"
+elif [ "$HAS_TOKEN" != "1" ]; then
+    boot_line "gw   " "${C_DIM}disabled (no token — run \`kent gateway config\`)${C_RESET}" "$C_GOLD"
+elif [ "$GW_TEST_OK" != "1" ] && [ "${KENT_NO_GATEWAY_TEST:-0}" != "1" ]; then
+    boot_line "gw   " "${C_GOLD}not spawned (smoke test failed; set KENT_NO_GATEWAY_TEST=1 to bypass)${C_RESET}" "$C_GOLD"
+else
+    boot_line "gw   " "spawning Discord gateway"
+    : > "$GATEWAY_LOG"
+    rm -f "$KENT_HOME/gateway.status.json" 2>/dev/null || true
+    ( uv run --quiet kent gateway run >> "$GATEWAY_LOG" 2>&1 ) &
+    GATEWAY_PID=$!
+
+    # Poll for on_ready (status file written) — give it 20s to reach Discord.
+    GW_OK=""
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+            break
+        fi
+        if [ -f "$KENT_HOME/gateway.status.json" ]; then
+            GW_OK=1
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [ -z "$GW_OK" ] || ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+        boot_line "gw   " "${C_RED}failed to come online${C_RESET} — see ${C_BOLD}${GATEWAY_LOG}${C_RESET}" "$C_RED"
+        if kill -0 "$GATEWAY_PID" 2>/dev/null; then
+            kill "$GATEWAY_PID" 2>/dev/null || true
+        fi
+        GATEWAY_PID=""
+    else
+        GW_USER="$(uv run --quiet python - "$KENT_HOME/gateway.status.json" <<'PY'
+import json, sys
+try:
+    print(json.loads(open(sys.argv[1]).read()).get("user") or "")
+except Exception:
+    print("")
+PY
+)"
+        if [ -n "$GW_USER" ]; then
+            boot_line "gw   " "online as ${C_BOLD}${GW_USER}${C_RESET} (pid ${C_BOLD}${GATEWAY_PID}${C_RESET}) — log: ${C_BOLD}${GATEWAY_LOG}${C_RESET}" "$C_GREEN"
+        else
+            boot_line "gw   " "online (pid ${C_BOLD}${GATEWAY_PID}${C_RESET}) — log: ${C_BOLD}${GATEWAY_LOG}${C_RESET}" "$C_GREEN"
+        fi
     fi
 fi
 
