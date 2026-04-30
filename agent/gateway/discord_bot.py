@@ -166,9 +166,13 @@ class DiscordGateway:
         self._wing_override = wing_override
         self._sessions: dict[int, ChannelSession] = {}
         self._sessions_lock = asyncio.Lock()
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        intents.presences = True
         self._bot: Any = commands.Bot(
-            intents=discord.Intents.default(),
             command_prefix=">",
+            intents=intents,
         )
         self._heartbeat: asyncio.Task | None = None
         self._ready_at: str | None = None
@@ -180,6 +184,11 @@ class DiscordGateway:
         # Missing-messages tracking: {channel_id_str: {"msg_id": int, "ts": str}}
         self._missing_msgs: dict[str, dict] = {}
         self._missing_path = _missing_msgs_file(_lc._kent_home())
+
+    @staticmethod
+    def _default_store_factory() -> "MemPalaceStore":
+        from ..memory.mempalace_store import MemPalaceStore
+        return MemPalaceStore()
 
     # ------------------------------------------------------------------
     # Persistence helpers
