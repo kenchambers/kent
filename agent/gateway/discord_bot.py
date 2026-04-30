@@ -8,6 +8,7 @@ with Discord tools bound to that channel.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -25,7 +26,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
 DISCORD_SUFFIX = (
     "You are speaking on Discord. Each channel/DM has its own memory wing. "
     "Use the discord_send, discord_react, discord_thread_create, "
@@ -33,6 +33,11 @@ DISCORD_SUFFIX = (
     "Replies are split automatically; keep individual messages reasonable. "
     "When the conversation moves to a new topic, create a thread."
 )
+
+
+def _missing_msgs_file(store_path: Path) -> Path:
+    """Path to the per-gateway missing-messages tracking file."""
+    return store_path / "gateway_missing_msgs.json"
 
 
 @dataclass
@@ -52,6 +57,9 @@ class ChannelSession:
     store: "MemPalaceStore | None" = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     registry: ToolRegistry | None = None
+    # Track the Discord message ID we most recently responded to in this channel.
+    # Used by the post-ready gap scanner to find missed messages.
+    last_response_id: int | None = None  # type: ignore[assignment]
 
 
 def _wing_for_channel(message: Any) -> str:
@@ -158,23 +166,158 @@ class DiscordGateway:
         self._wing_override = wing_override
         self._sessions: dict[int, ChannelSession] = {}
         self._sessions_lock = asyncio.Lock()
-        self._llm = llm_factory()
+        self._bot: Any = commands.Bot(
+            intents=discord.Intents.default(),
+            command_prefix=">",
+        )
+        self._heartbeat: asyncio.Task | None = None
         self._ready_at: str | None = None
-        self._heartbeat: "Any" = None  # Heartbeat | None
 
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.members = True
-        intents.presences = True
-
-        self._bot = commands.Bot(command_prefix="!", intents=intents)
+        # Register event handlers before the bot starts
         self._bot.event(self.on_ready)
         self._bot.event(self.on_message)
 
-    @staticmethod
-    def _default_store_factory() -> "MemPalaceStore":
-        from ..memory.mempalace_store import MemPalaceStore
-        return MemPalaceStore()
+        # Missing-messages tracking: {channel_id_str: {"msg_id": int, "ts": str}}
+        self._missing_msgs: dict[str, dict] = {}
+        self._missing_path = _missing_msgs_file(_lc._kent_home())
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def _load_missing_msgs(self) -> None:
+        """Load previously tracked last-response IDs from disk."""
+        try:
+            data = json.loads(self._missing_path.read_text())
+            if isinstance(data, dict):
+                self._missing_msgs = data
+                logger.info(f"[gateway] loaded {len(self._missing_msgs)} tracked channels")
+        except Exception:
+            self._missing_msgs = {}
+
+    def _save_missing_msg(self, channel_id: int, msg_id: int) -> None:
+        """Persist the last-response message ID for a channel."""
+        self._missing_msgs[str(channel_id)] = {
+            "msg_id": msg_id,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        try:
+            tmp = self._missing_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._missing_msgs))
+            tmp.replace(self._missing_path)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Post-ready gap scanner
+    # ------------------------------------------------------------------
+
+    async def _scan_and_respond(self) -> None:
+        """On startup/restart, check tracked channels for unresponded messages.
+
+        For each channel that was active when Kent went down, looks at Discord
+        history between the *last successful response* and *now*. If there are
+        any new human messages the gateway didn't reply to, processes them now.
+        This catches messages lost due to disconnects, crashes, or misfires.
+        """
+        bot_user = self._bot.user
+        if not bot_user or not self._missing_msgs:
+            return
+
+        scanned = 0
+        acted = 0
+        now_cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        for cid_str, info in list(self._missing_msgs.items()):
+            cid = int(cid_str)
+            last_id = int(info.get("msg_id", 0))
+            ts_str = info.get("ts", "")
+
+            # Skip entries older than ~12 hours (cleanup stale trackers)
+            try:
+                last_ts = datetime.fromisoformat(ts_str)
+                if (datetime.now(timezone.utc) - last_ts).total_seconds() > 12 * 3600:
+                    del self._missing_msgs[cid_str]
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+            try:
+                channel = await self._bot.fetch_channel(cid)
+            except Exception:
+                # Channel no longer accessible (deleted, kicked, etc.)
+                del self._missing_msgs[cid_str]
+                continue
+
+            scanned += 1
+            messages_to_process: list[Any] = []
+
+            if last_id > 0:
+                # Look for messages AFTER our last response
+                try:
+                    async for msg in channel.history(after=bot_user.created_at, limit=50):
+                        if msg.id == last_id:
+                            break
+                        if msg.author.bot:
+                            continue
+                        # Check if Kent already responded (look for a message from us after this one)
+                        found_reply = False
+                        try:
+                            async for prev in channel.history(before=msg.created_at, limit=1):
+                                if prev and prev.author == bot_user:
+                                    found_reply = True
+                                    break
+                        except Exception:
+                            pass
+                        if not found_reply:
+                            messages_to_process.append(msg)
+                except Exception:
+                    pass
+            else:
+                # First time seeing this channel — grab recent unanswered messages
+                try:
+                    async for msg in channel.history(limit=50):
+                        if msg.author.bot:
+                            continue
+                        # Has Kent replied?
+                        found_reply = False
+                        try:
+                            async for prev in channel.history(before=msg.created_at, limit=1):
+                                if prev and prev.author == bot_user:
+                                    found_reply = True
+                                    break
+                        except Exception:
+                            pass
+                        if not found_reply:
+                            messages_to_process.append(msg)
+                except Exception:
+                    pass
+
+            if messages_to_process:
+                acted += len(messages_to_process)
+                logger.info(
+                    f"[gateway] scanning #{channel.name} (cid={cid}): "
+                    f"{len(messages_to_process)} unresponded message(s)"
+                )
+                # Process messages oldest-first
+                for msg in sorted(messages_to_process, key=lambda m: m.created_at):
+                    try:
+                        await self._handle_turn(await self._session_for(msg), msg)
+                    except Exception:
+                        logger.exception("[gateway] failed to process missed message %s", msg.id)
+
+        if acted > 0:
+            print(
+                f"[gateway] post-ready scan complete: scanned {scanned} channels, "
+                f"replied to {acted} missed message(s)",
+                flush=True,
+            )
+        else:
+            print(f"[gateway] post-ready scan complete: {scanned} channels checked, nothing missed", flush=True)
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
 
     async def on_ready(self) -> None:  # noqa: D401 — discord.py event signature
         import discord
@@ -201,6 +344,15 @@ class DiscordGateway:
         if self._ready_at is None:
             self._ready_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._write_status_snapshot()
+
+        # --- Load previously tracked channels and scan for missed messages ---
+        self._load_missing_msgs()
+        if self._missing_msgs:
+            try:
+                await self._scan_and_respond()
+            except Exception:
+                logger.exception("[gateway] post-ready scan failed")
+
         self._start_heartbeat()
 
     def _write_status_snapshot(self) -> None:
@@ -319,78 +471,18 @@ class DiscordGateway:
                 )
             except Exception:
                 pass
-            return
+            new_messages.append({"role": "assistant", "content": "[error]"})
+            terminal_reason = "exception"
 
-        session.history = [*history, *new_messages]
+        # Persist: update session history, save last-response ID, track missed msgs
+        session.history.extend(new_messages)
+        self._save_missing_msg(int(message.channel.id), message.id)
 
-        # If the run terminated for any reason other than `completed` without ever
-        # producing a user-visible reply, surface the silence so the channel doesn't
-        # look dead. completed = LLM ended on a text-only turn (Phase 4 of loop.py).
-        if terminal_reason and terminal_reason != "completed" and not sent_any_text:
-            try:
-                await message.channel.send(
-                    f"[gateway] run terminated ({terminal_reason}) without producing a "
-                    "final reply. Reply to continue or rephrase."
-                )
-            except Exception:
-                logger.exception("fallback send failed")
+        # Trim very long histories
+        if len(session.history) > 200:
+            session.history = session.history[-150:]
 
-    def _start_heartbeat(self) -> None:
-        from .heartbeat import Heartbeat, parse_interval
-        interval_str = self._settings.heartbeat_interval or ""
-        interval_s = parse_interval(interval_str)
-        cid = self._settings.heartbeat_channel_id
-        if interval_s and interval_s > 0 and cid:
-            logger.info(
-                "heartbeat enabled: interval=%.0fs channel=%d", interval_s, cid
-            )
-            hb = Heartbeat(
-                gateway=self,
-                interval_s=interval_s,
-                channel_id=cid,
-            )
-            self._heartbeat = hb.start()
-        else:
-            logger.debug("heartbeat disabled (interval=%r channel=%r)", interval_str, cid)
-
-    async def _run_heartbeat_turn(self, channel_id: int, prompt_text: str) -> None:
-        session = await self._session_for_channel_id(channel_id)
-        assert session.store is not None and session.registry is not None
-        system_prompt = self._system_prompt_factory(session.store) + "\n\n" + DISCORD_SUFFIX
-        history = [*session.history, {"role": "user", "content": prompt_text}]
-        new_messages: list[dict] = []
-
-        async with session.lock:
-            try:
-                async for ev in agent_run(
-                    messages=history,
-                    tools=session.registry,
-                    llm=self._llm,
-                    system=system_prompt,
-                    max_turns=25,
-                    memory_store=session.store,
-                ):
-                    if isinstance(ev, AssistantMessageComplete):
-                        new_messages.append(ev.message.to_openai_dict())
-                    elif isinstance(ev, Terminal):
-                        break
-            except Exception:
-                logger.exception("heartbeat agent run failed")
-                return
-
-        session.history = [*history, *new_messages]
-
-    async def start(self) -> None:
-        await self._bot.start(self._token)
-
-    async def close(self) -> None:
-        if self._heartbeat is not None:
-            self._heartbeat.cancel()
-            try:
-                await self._heartbeat
-            except (asyncio.CancelledError, Exception):
-                pass
-        await self._bot.close()
+        self._write_status_snapshot()
 
 
 async def run_gateway(
