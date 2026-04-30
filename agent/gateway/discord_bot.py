@@ -493,6 +493,18 @@ class DiscordGateway:
 
         self._write_status_snapshot()
 
+    async def start(self) -> None:
+        await self._bot.start(self._token)
+
+    async def close(self) -> None:
+        if self._heartbeat is not None:
+            self._heartbeat.cancel()
+            try:
+                await self._heartbeat
+            except (asyncio.CancelledError, Exception):
+                pass
+        await self._bot.close()
+
 
 async def run_gateway(
     *,
