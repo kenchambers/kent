@@ -5,7 +5,7 @@ from pathlib import Path
 
 from agent.llm import LLM
 from agent.tools import ToolRegistry
-from agent.builtin.shell import Shell, detect_shell_backend
+from agent.builtin.shell import Shell
 from agent.builtin.web_fetch import WebFetch
 from agent.builtin.web_search import WebSearch
 from agent.builtin.memory_recall import MemoryRecall
@@ -81,7 +81,7 @@ class ChatSession:
 
     def _build_tools(self) -> ToolRegistry:
         reg = ToolRegistry()
-        reg.register(Shell(backend=detect_shell_backend()))
+        reg.register(Shell())
         reg.register(WebSearch())
         reg.register(WebFetch())
         # Memory + diary + wing tools — without these the chat panel can't
