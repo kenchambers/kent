@@ -188,10 +188,10 @@ def mtime_signature(palace: Path, kent_home: Path) -> tuple:
 
 
 def start_server(palace: Path, kent_home: Path, *, port: int = 8765,
-                 chat_session=None) -> None:
+                 host: str = "127.0.0.1", chat_session=None) -> None:
     VizHandler.palace = palace
     VizHandler.kent_home = kent_home
     VizHandler.chat_session = chat_session  # may be None for read-only mode
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), VizHandler)
+    srv = http.server.ThreadingHTTPServer((host, port), VizHandler)
     srv.daemon_threads = True
     srv.serve_forever()

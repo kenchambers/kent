@@ -2078,9 +2078,11 @@ def cmd_viz(args: argparse.Namespace) -> int:
         chat = ChatSession(llm=llm, palace=_DEFAULT_PALACE, kent_home=_DEFAULT_KENT_HOME)
 
     mode = "chat+graph" if chat else "graph (read-only)"
-    print(f"kent viz [{mode}] → http://127.0.0.1:{args.port}")
+    display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
+    print(f"kent viz [{mode}] → http://{display_host}:{args.port}"
+          + (f"  (bound on {args.host} — reachable from LAN)" if args.host == "0.0.0.0" else ""))
     start_server(_DEFAULT_PALACE, _DEFAULT_KENT_HOME,
-                 port=args.port, chat_session=chat)
+                 host=args.host, port=args.port, chat_session=chat)
     return 0
 
 
@@ -2222,6 +2224,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # `kent viz [--port N] [--read-only]`
     p_viz = sub.add_parser("viz", help="Open the live 3D palace viewer + chat")
     p_viz.add_argument("--port", type=int, default=8765)
+    p_viz.add_argument("--host", default="127.0.0.1",
+                       help="bind address (default 127.0.0.1; use 0.0.0.0 for LAN)")
     p_viz.add_argument("--read-only", action="store_true",
                        help="disable the chat panel; just render the palace")
     p_viz.set_defaults(func=cmd_viz)
