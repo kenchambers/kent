@@ -13,8 +13,10 @@
 #
 # Env overrides:
 #   KENT_VIZ_PORT   port for the viz server         (default: 8765)
+#   KENT_VIZ_HOST   bind address for viz            (default: 0.0.0.0 on WSL, 127.0.0.1 elsewhere)
 #   KENT_NO_VIZ=1   skip viz (REPL-only)
 #   KENT_NO_OPEN=1  skip auto-opening the browser
+#   KENT_NO_LAN=1   skip Windows portproxy/firewall setup (WSL only)
 #   KENT_HOME       kent home dir                   (default: ~/.kent)
 
 set -euo pipefail
@@ -85,6 +87,73 @@ boot_line() {
     # Args: label, message, color (default: cyan)
     local label="$1" msg="$2" color="${3:-$C_CYAN}"
     printf "  ${C_GREY}[${C_RESET}${color}%-5s${C_RESET}${C_GREY}]${C_RESET} %s\n" "$label" "$msg"
+}
+
+is_wsl() {
+    grep -qi microsoft /proc/version 2>/dev/null
+}
+
+setup_wsl_lan_forward() {
+    # Configure Windows port-forward + firewall so the viz port is reachable
+    # from other LAN devices. Idempotent: only triggers UAC when the existing
+    # rule is missing or its connectaddress no longer matches the WSL IP
+    # (which changes across WSL restarts in default networking mode).
+    #
+    # Args: wsl_ip, port
+    local wsl_ip="$1" port="$2"
+    local rule_name="kent viz $port"
+    local ps_dir="/mnt/c/Windows/Temp"
+    local ps_path="$ps_dir/kent-lan-setup-$port.ps1"
+    local ps_path_win="C:\\Windows\\Temp\\kent-lan-setup-$port.ps1"
+
+    if ! command -v powershell.exe >/dev/null 2>&1; then
+        boot_line "lan  " "${C_GOLD}powershell.exe not found — skipping Windows setup${C_RESET}" "$C_GOLD"
+        return 1
+    fi
+
+    # Pre-check: skip elevation if rule is already correct.
+    local current_target
+    current_target="$(powershell.exe -NoProfile -Command "(netsh interface portproxy show v4tov4 | Select-String -Pattern '0\.0\.0\.0\s+$port\s+(\S+)\s+$port' | ForEach-Object { \$_.Matches.Groups[1].Value }) -join ''" 2>/dev/null | tr -d '\r' | head -1)"
+    local fw_exists
+    fw_exists="$(powershell.exe -NoProfile -Command "if (Get-NetFirewallRule -DisplayName '$rule_name' -ErrorAction SilentlyContinue) { 'True' } else { 'False' }" 2>/dev/null | tr -d '\r' | head -1)"
+
+    if [ "$current_target" = "$wsl_ip" ] && [ "$fw_exists" = "True" ]; then
+        boot_line "lan  " "Windows forward already configured (→ ${C_BOLD}${wsl_ip}:${port}${C_RESET})" "$C_GREEN"
+        return 0
+    fi
+
+    # Write a small .ps1 to the Windows temp dir, then invoke it elevated.
+    # Bash $vars expand here; PS $vars are escaped with \$.
+    cat > "$ps_path" <<EOF
+\$ErrorActionPreference = 'SilentlyContinue'
+\$wslIp = "$wsl_ip"
+\$port = $port
+\$ruleName = "$rule_name"
+# IP Helper service (iphlpsvc) is what actually binds the portproxy listener.
+# If it's stopped, netsh rules are inert.
+Set-Service -Name iphlpsvc -StartupType Automatic
+Start-Service -Name iphlpsvc
+& netsh interface portproxy delete v4tov4 listenport=\$port listenaddress=0.0.0.0 | Out-Null
+& netsh interface portproxy add    v4tov4 listenport=\$port listenaddress=0.0.0.0 connectport=\$port connectaddress=\$wslIp | Out-Null
+if (-not (Get-NetFirewallRule -DisplayName \$ruleName -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName \$ruleName -Direction Inbound -LocalPort \$port -Protocol TCP -Action Allow -Profile Any | Out-Null
+}
+EOF
+
+    boot_line "lan  " "configuring Windows port-forward (UAC prompt may appear)…"
+    if powershell.exe -NoProfile -Command "Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','$ps_path_win' -Verb RunAs -Wait" >/dev/null 2>&1; then
+        # Re-verify
+        current_target="$(powershell.exe -NoProfile -Command "(netsh interface portproxy show v4tov4 | Select-String -Pattern '0\.0\.0\.0\s+$port\s+(\S+)\s+$port' | ForEach-Object { \$_.Matches.Groups[1].Value }) -join ''" 2>/dev/null | tr -d '\r' | head -1)"
+        if [ "$current_target" = "$wsl_ip" ]; then
+            boot_line "lan  " "Windows forward live: 0.0.0.0:${port} → ${C_BOLD}${wsl_ip}:${port}${C_RESET}" "$C_GREEN"
+            return 0
+        fi
+        boot_line "lan  " "${C_GOLD}forward not verified — UAC may have been declined${C_RESET}" "$C_GOLD"
+        return 1
+    else
+        boot_line "lan  " "${C_RED}elevation failed${C_RESET} — run manually: ${C_BOLD}powershell -File ${ps_path_win}${C_RESET} (as admin)" "$C_RED"
+        return 1
+    fi
 }
 
 cleanup() {
@@ -272,9 +341,19 @@ fi
 if [ "${KENT_NO_VIZ:-0}" = "1" ]; then
     boot_line "viz  " "${C_DIM}skipped (KENT_NO_VIZ=1)${C_RESET}" "$C_GOLD"
 else
-    boot_line "viz  " "spawning 3D palace viewer on :${VIZ_PORT}"
+    # Default bind: 0.0.0.0 on WSL (so the LAN can reach it through the
+    # Windows portproxy we set up below); 127.0.0.1 elsewhere.
+    if [ -n "${KENT_VIZ_HOST:-}" ]; then
+        VIZ_HOST="$KENT_VIZ_HOST"
+    elif is_wsl; then
+        VIZ_HOST="0.0.0.0"
+    else
+        VIZ_HOST="127.0.0.1"
+    fi
+
+    boot_line "viz  " "spawning 3D palace viewer on ${VIZ_HOST}:${VIZ_PORT}"
     : > "$VIZ_LOG"
-    ( uv run --quiet kent viz --port "$VIZ_PORT" >> "$VIZ_LOG" 2>&1 ) &
+    ( uv run --quiet kent viz --host "$VIZ_HOST" --port "$VIZ_PORT" >> "$VIZ_LOG" 2>&1 ) &
     VIZ_PID=$!
 
     # Poll until the server binds (or give up after ~12s). Probe via bash's
@@ -302,6 +381,20 @@ else
                 open "http://127.0.0.1:$VIZ_PORT" 2>/dev/null || true
             elif command -v xdg-open >/dev/null 2>&1; then
                 xdg-open "http://127.0.0.1:$VIZ_PORT" >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # WSL only: forward the port from Windows → WSL so devices on the LAN
+        # can reach the viz. Skipped if KENT_NO_LAN=1, host is loopback, or
+        # we're not actually on WSL.
+        if [ "${KENT_NO_LAN:-0}" != "1" ] && [ "$VIZ_HOST" = "0.0.0.0" ] && is_wsl; then
+            WSL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+            if [ -n "$WSL_IP" ]; then
+                setup_wsl_lan_forward "$WSL_IP" "$VIZ_PORT" || true
+                WIN_LAN_IP="$(powershell.exe -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.IPAddress -notlike '127.*' -and \$_.IPAddress -notlike '169.254.*' -and \$_.InterfaceAlias -notlike '*WSL*' -and \$_.InterfaceAlias -notlike '*Loopback*' } | Select-Object -First 1).IPAddress" 2>/dev/null | tr -d '\r' | head -1)"
+                if [ -n "$WIN_LAN_IP" ]; then
+                    boot_line "lan  " "LAN URL: ${C_BOLD}${C_INK}http://${WIN_LAN_IP}:${VIZ_PORT}${C_RESET}" "$C_GREEN"
+                fi
             fi
         fi
     fi
