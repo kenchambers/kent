@@ -1772,6 +1772,14 @@ def cmd_gateway_run(args: argparse.Namespace) -> int:
     def _llm_factory():
         return _gateway_make_llm(service_override, model_override)
 
+    import logging as _logging
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+
     print(
         f"[gateway] starting (mention_only={settings.mention_only}, "
         f"status={settings.status})",

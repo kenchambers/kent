@@ -1,5 +1,6 @@
 import json
 import asyncio
+import logging
 from typing import Protocol, AsyncGenerator, Any
 from .events import (
     TextDelta, ToolCall, ToolCallStart, ToolCallDelta,
@@ -8,8 +9,29 @@ from .events import (
 from .state import Message
 
 
+logger = logging.getLogger(__name__)
+
+
 class ContextOverflowError(Exception):
     pass
+
+
+def _summarize_role_sequence(messages: list[dict]) -> str:
+    """Build a short role-sequence summary for diagnosing 400s from servers
+    that don't tell us why the request was rejected (e.g. atlascloud).
+    Surfaces orphan tool messages and assistant tool_calls without responses.
+    """
+    parts: list[str] = []
+    for m in messages:
+        role = m.get("role", "?")
+        if role == "assistant" and m.get("tool_calls"):
+            ids = [tc.get("id", "")[:6] for tc in (m.get("tool_calls") or [])]
+            parts.append(f"asst[tc:{','.join(ids)}]")
+        elif role == "tool":
+            parts.append(f"tool({(m.get('tool_call_id') or '')[:6]})")
+        else:
+            parts.append(role)
+    return " ".join(parts)
 
 
 class LLM(Protocol):
@@ -168,10 +190,17 @@ class OpenAICompatibleLLM:
         except Exception as e:
             from openai import BadRequestError
             if isinstance(e, BadRequestError):
+                body = getattr(e, "body", "")
+                body_str = str(body)
                 code = getattr(e, "code", None) or ""
-                body_str = str(getattr(e, "body", "")).lower()
+                logger.error(
+                    "LLM 400 from %s: code=%r body=%s | %d msgs: %s",
+                    self.model, code, body_str,
+                    len(all_messages), _summarize_role_sequence(all_messages),
+                )
+                body_lower = body_str.lower()
                 if (code in ("context_length_exceeded", "string_above_max_length")
-                        or "context length" in body_str
-                        or "maximum context" in body_str):
+                        or "context length" in body_lower
+                        or "maximum context" in body_lower):
                     raise ContextOverflowError(str(e)) from e
             raise

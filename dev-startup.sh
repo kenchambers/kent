@@ -396,15 +396,23 @@ else
         VIZ_HOST="127.0.0.1"
     fi
 
+    # Kill any stale viz process that's still holding the port from a previous run.
+    STALE_VIZ_PID="$(lsof -ti :"$VIZ_PORT" 2>/dev/null || true)"
+    if [ -n "$STALE_VIZ_PID" ]; then
+        boot_line "viz  " "clearing stale process on port ${VIZ_PORT} (pid ${STALE_VIZ_PID})" "$C_GOLD"
+        kill "$STALE_VIZ_PID" 2>/dev/null || true
+        sleep 0.5
+    fi
+
     boot_line "viz  " "spawning 3D palace viewer on ${VIZ_HOST}:${VIZ_PORT}"
     : > "$VIZ_LOG"
     ( uv run --quiet kent viz --host "$VIZ_HOST" --port "$VIZ_PORT" >> "$VIZ_LOG" 2>&1 ) &
     VIZ_PID=$!
 
-    # Poll until the server binds (or give up after ~12s). Probe via bash's
+    # Poll until the server binds (or give up after ~30s). Probe via bash's
     # built-in /dev/tcp so this works on minimal images without curl/wget.
     BOOT_OK=""
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 150); do
         if ! kill -0 "$VIZ_PID" 2>/dev/null; then
             break
         fi
@@ -581,6 +589,17 @@ elif [ "$HAS_TOKEN" != "1" ]; then
 elif [ "$GW_TEST_OK" != "1" ] && [ "${KENT_NO_GATEWAY_TEST:-0}" != "1" ]; then
     boot_line "gw   " "${C_GOLD}not spawned (smoke test failed; set KENT_NO_GATEWAY_TEST=1 to bypass)${C_RESET}" "$C_GOLD"
 else
+    # Kill any stale gateway process left from a previous run.
+    STALE_GW_PID=""
+    if [ -f "$KENT_HOME/gateway.pid" ]; then
+        STALE_GW_PID="$(cat "$KENT_HOME/gateway.pid" 2>/dev/null || true)"
+    fi
+    if [ -n "$STALE_GW_PID" ] && kill -0 "$STALE_GW_PID" 2>/dev/null; then
+        boot_line "gw   " "clearing stale gateway process (pid ${STALE_GW_PID})" "$C_GOLD"
+        kill "$STALE_GW_PID" 2>/dev/null || true
+        sleep 0.5
+    fi
+
     boot_line "gw   " "spawning Discord gateway"
     : > "$GATEWAY_LOG"
     rm -f "$KENT_HOME/gateway.status.json" 2>/dev/null || true

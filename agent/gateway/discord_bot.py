@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
 from . import lifecycle as _lc
-from ..events import AssistantMessageComplete, Terminal
+from ..events import AssistantMessageComplete, ModelError, Terminal
 from ..llm import OpenAICompatibleLLM
 from ..loop import run as agent_run
 from ..tools import ToolRegistry
@@ -75,6 +75,21 @@ def _wing_for_channel(message: Any) -> str:
     if len(name) > 64:
         name = name[:64]
     return name
+
+
+def _safe_history_window(history: list[dict], max_keep: int) -> list[dict]:
+    """Trim history to the last max_keep messages, but realign the start to a
+    `user` turn boundary so we never send orphan tool messages whose matching
+    assistant tool_calls were dropped — OpenAI-compatible servers reject those
+    with a 400.
+    """
+    if len(history) <= max_keep:
+        return history
+    window = history[-max_keep:]
+    for i, msg in enumerate(window):
+        if msg.get("role") == "user":
+            return window[i:]
+    return []
 
 
 def _split_for_discord(text: str, limit: int = 1900) -> list[str]:
@@ -306,8 +321,12 @@ class DiscordGateway:
 
             if messages_to_process:
                 acted += len(messages_to_process)
+                channel_label = getattr(channel, "name", None)
+                if not channel_label:
+                    recipient = getattr(channel, "recipient", None)
+                    channel_label = f"DM:{getattr(recipient, 'name', None) or cid}"
                 logger.info(
-                    f"[gateway] scanning #{channel.name} (cid={cid}): "
+                    f"[gateway] scanning #{channel_label} (cid={cid}): "
                     f"{len(messages_to_process)} unresponded message(s)"
                 )
                 # Process messages oldest-first
@@ -410,6 +429,9 @@ class DiscordGateway:
             return False
         if getattr(message.author, "bot", False):
             return False
+        # DMs are inherently directed at the bot — always respond.
+        if message.guild is None:
+            return True
         if self._settings.mention_only:
             return self._bot.user in message.mentions
         return True
@@ -418,7 +440,14 @@ class DiscordGateway:
         try:
             if self._bot.user is None:
                 return
+            is_dm = message.guild is None
+            print(
+                f"[on_message] from={message.author} dm={is_dm} "
+                f"content={message.content!r:.60}",
+                flush=True,
+            )
             if not self._should_respond(message):
+                print(f"[on_message] skipped (mention_only={self._settings.mention_only})", flush=True)
                 return
             session = await self._session_for(message)
             async with session.lock:
@@ -471,6 +500,8 @@ class DiscordGateway:
                         text = (ev.message.content or "").strip()
                         if text:
                             await _send(text)
+                    elif isinstance(ev, ModelError):
+                        logger.error("model error: %s: %s", type(ev.error).__name__, ev.error)
                     elif isinstance(ev, Terminal):
                         terminal_reason = ev.reason
                         break
@@ -485,13 +516,22 @@ class DiscordGateway:
             new_messages.append({"role": "assistant", "content": "[error]"})
             terminal_reason = "exception"
 
+        if terminal_reason and terminal_reason != "completed" and not sent_any_text:
+            try:
+                await message.channel.send(
+                    f"[gateway] run terminated ({terminal_reason}) without producing a "
+                    "final reply. Reply to continue or rephrase."
+                )
+            except Exception:
+                logger.exception("fallback send failed")
+
         # Persist: update session history, save last-response ID, track missed msgs
         session.history.extend(new_messages)
         self._save_missing_msg(int(message.channel.id), message.id)
 
-        # Trim very long histories
+        # Trim very long histories (safe-realign to a user-turn boundary).
         if len(session.history) > 200:
-            session.history = session.history[-150:]
+            session.history = _safe_history_window(session.history, 150)
 
         self._write_status_snapshot()
 
@@ -578,7 +618,7 @@ class DiscordGateway:
             finally:
                 session.history.extend(new_messages)
                 if len(session.history) > 200:
-                    session.history = session.history[-150:]
+                    session.history = _safe_history_window(session.history, 150)
 
     async def start(self) -> None:
         await self._bot.start(self._token)
