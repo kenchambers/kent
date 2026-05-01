@@ -21,6 +21,12 @@ from ..llm import OpenAICompatibleLLM
 from ..loop import run as agent_run
 from ..tools import ToolRegistry
 
+try:
+    from ..mcp.client import McpClient, McpServerConfig
+    _MCP_AVAILABLE = True
+except ImportError:
+    _MCP_AVAILABLE = False
+
 if TYPE_CHECKING:
     from ..memory.mempalace_store import MemPalaceStore
 

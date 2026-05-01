@@ -47,6 +47,12 @@ from .events import (
 from .llm import LLM, OpenAICompatibleLLM
 from .loop import run
 from .tools import ToolRegistry
+try:
+    from .mcp.client import McpClient, McpServerConfig
+    _MCP_AVAILABLE = True
+except ImportError:
+    _MCP_AVAILABLE = False
+
 
 if TYPE_CHECKING:
     from .memory.store import MemoryStore
@@ -358,11 +364,75 @@ def _build_shell_executor():
     return default_executor()
 
 
+def _load_mcp_config() -> dict[str, Any]:
+    """Load MCP server configurations from ~/.kent/config.json."""
+    cfg = load_config()
+    return cfg.get("mcp_servers", {})
+
+
+async def _register_mcp_tools(registry: ToolRegistry) -> None:
+    """Connect to MCP servers (if any) and register their tools. Non-blocking and best-effort."""
+    if not _MCP_AVAILABLE:
+        return
+    
+    mcp_cfg = _load_mcp_config()
+    if not mcp_cfg or not isinstance(mcp_cfg, dict):
+        return
+    
+    client = McpClient()
+    
+    for server_name, server_conf in mcp_cfg.items():
+        try:
+            if not isinstance(server_conf, dict):
+                continue
+            
+            if "command" in server_conf:
+                # stdio transport
+                await client.connect_stdio(McpServerConfig(
+                    command=server_conf["command"],
+                    args=server_conf.get("args"),
+                    env=server_conf.get("env"),
+                    name=server_name,
+                ))
+            elif "url" in server_conf:
+                # SSE transport
+                await client.connect_sse(McpServerConfig(
+                    url=server_conf["url"],
+                    name=server_name,
+                ))
+            else:
+                print(f"[MCP] Skipping {server_name}: no valid transport configuration")
+                
+        except Exception as e:
+            print(f"[MCP] Warning: failed to connect {server_name}: {e}")
+            continue
+    
+    if client._discovered_tools:
+        client.register_with_registry(registry)
+        
+        # Log discovered tools
+        for tool_info, _, srv_name in client._discovered_tools:
+            tool_full_name = f"{srv_name}:{tool_info.name}"
+            print(f"[MCP] Registered tool: {tool_full_name} - {tool_info.description[:80]}...")
+        
+        print(f"[MCP] Loaded {len(client._discovered_tools)} tool(s) from {len(client._connections)} MCP server(s)")
+    
+    # Cleanup MCP connections (they're still alive for future calls)
+    # Note: client stays alive via module-level reference
+
+
 def build_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(WebSearch())
     registry.register(WebFetch())
     registry.register(Shell(executor=_build_shell_executor()))
+    
+    # Register MCP tools (best-effort, non-blocking)
+    try:
+        asyncio.get_event_loop().run_until_complete(_register_mcp_tools(registry))
+    except Exception as e:
+        print(f"[MCP] Error registering MCP tools: {e}")
+    
     return registry
 
 
