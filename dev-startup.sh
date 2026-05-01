@@ -192,7 +192,7 @@ print_banner() {
         sleep 0.04 2>/dev/null || true
     done
     printf "\n"
-    typeout "     ${C_GOLD}◇${C_RESET}${C_DIM} a memory palace, drawn live ${C_RESET}${C_GOLD}◇${C_RESET}" 0.012
+    typeout "     ${C_GOLD}◇${C_RESET}${C_DIM} a self improving persistent memory palace${C_RESET}${C_GOLD}◇${C_RESET}" 0.012
     printf "\n"
 }
 
