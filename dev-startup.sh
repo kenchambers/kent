@@ -93,6 +93,22 @@ is_wsl() {
     grep -qi microsoft /proc/version 2>/dev/null
 }
 
+detect_system() {
+    # Returns one of: wsl | linux | macos | windows_bash | unknown
+    local uname_s
+    uname_s="$(uname -s 2>/dev/null || echo "unknown")"
+    case "$uname_s" in
+        Linux)
+            if is_wsl; then echo "wsl"; else echo "linux"; fi ;;
+        Darwin)
+            echo "macos" ;;
+        MINGW*|CYGWIN*|MSYS*)
+            echo "windows_bash" ;;
+        *)
+            echo "unknown" ;;
+    esac
+}
+
 setup_wsl_lan_forward() {
     # Configure Windows port-forward + firewall so the viz port is reachable
     # from other LAN devices. Idempotent: only triggers UAC when the existing
@@ -214,6 +230,35 @@ EOF
 # ---------- 0. banner ------------------------------------------------------ #
 
 print_banner
+
+# ---------- 0b. system detection ------------------------------------------ #
+
+SYS_TYPE="$(detect_system)"
+
+case "$SYS_TYPE" in
+    wsl)
+        boot_line "sys  " "WSL2 on Windows  ${C_DIM}(full support)${C_RESET}" "$C_GREEN"
+        ;;
+    linux)
+        boot_line "sys  " "Linux  ${C_DIM}(full support)${C_RESET}" "$C_GREEN"
+        ;;
+    macos)
+        boot_line "sys  " "macOS  ${C_DIM}(full support)${C_RESET}" "$C_GREEN"
+        ;;
+    windows_bash)
+        boot_line "sys  " "${C_RED}Windows (Git Bash / MSYS2)${C_RESET} — WSL2 is strongly recommended" "$C_RED"
+        printf "\n  Some features (viz port-forward, shell tool) may not work correctly.\n"
+        printf "  Continue anyway? (y/N): "
+        read -r _SYS_CONT || _SYS_CONT=""
+        if [ "${_SYS_CONT:-n}" != "y" ] && [ "${_SYS_CONT:-n}" != "Y" ]; then
+            printf "\n  Exiting. Install WSL2 and re-run from a WSL terminal.\n\n"
+            exit 1
+        fi
+        ;;
+    *)
+        boot_line "sys  " "${C_GOLD}unknown system (uname=$(uname -s 2>/dev/null)) — proceeding with caution${C_RESET}" "$C_GOLD"
+        ;;
+esac
 
 # ---------- 1. install ----------------------------------------------------- #
 
