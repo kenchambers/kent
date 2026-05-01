@@ -521,10 +521,7 @@ SLASH_HELP = """\
 slash commands:
   /help                  show this list
   /tools                 list registered tools
-
-bang commands (! prefix):
-  ! view logs            tail gateway + viz log files
-
+  /logs                  tail gateway + viz log files
 
   /model                 show current service / model
   /clear                 clear conversation history
@@ -558,7 +555,9 @@ def _handle_slash(
     if head in ("/exit", "/quit"):
         print(_ui.c(_ui.DIM, "bye."))
         return history, True
-    if head == "/help":
+    if head == "/logs":
+        _show_logs()
+    elif head == "/help":
         print(SLASH_HELP)
     elif head == "/tools":
         print("tools: " + ", ".join(registry.names()))
@@ -866,7 +865,7 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     print(_ui.field("Tools",   _ui.c(_ui.CYAN, ", ".join(registry.names())), label_width=7))
     print(_ui.field("Memory",  _ui.c(_ui.DIM, str(memory_store.palace_path)), label_width=7))
     print(_ui.field("Wing",    _ui.c(_ui.GOLD, memory_store.active_wing), label_width=7))
-    print("  " + _ui.c(_ui.DIM, "Type your message. /help for slash commands. ! view logs to tail logs. /exit to quit."))
+    print("  " + _ui.c(_ui.DIM, "Type your message. /help for slash commands. /logs to tail logs. /exit to quit."))
     print(_ui.rule())
 
     # Scout banner: show pending suggestions at session start (cron-mode users
@@ -887,7 +886,7 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
             f"<project-readme>\n{readme_content}\n</project-readme>\n\n"
             "Greet the user with a brief welcome. Let them know you can see the project "
             "README and can answer any questions about it. Also mention: to view logs, "
-            "they can type `! view logs` at the prompt."
+            "they can type `/logs` at the prompt."
         )
         print()
         history, _ = await _run_once(
@@ -914,13 +913,6 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
             )
             if should_exit:
                 return
-            continue
-        if user_input.startswith("!"):
-            bang_cmd = user_input[1:].strip().lower()
-            if bang_cmd == "view logs":
-                _show_logs()
-            else:
-                print(f"  unknown ! command. try: {_ui.c(_ui.BOLD, '! view logs')}")
             continue
         try:
             history, _ = await _stream_one_turn(
