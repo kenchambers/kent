@@ -116,18 +116,107 @@ def clear_pid() -> None:
 
 
 def spawn_detached(argv: list[str], log_path: Path) -> int:
-    """Spawn argv as a detached child; return the child PID."""
+    """Spawn argv as a fully-detached daemon; return the daemon's PID.
+
+    On POSIX uses a true double-fork (fork → setsid → fork → exec) so the
+    daemon survives termination of the original session — the WSL2 +
+    short-lived-shell case where systemd's user-session cleanup would
+    otherwise reap orphans of a one-shot bash invocation. The grandchild
+    becomes a child of init/PID 1, severs its controlling terminal, and is
+    no longer in any cgroup tied to the originating login session.
+
+    On platforms without ``os.fork`` (Windows), falls back to
+    ``subprocess.Popen(start_new_session=True)`` — the prior behavior.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(log_path, "ab")
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=log_fh,
-        stderr=log_fh,
-        start_new_session=True,
-        close_fds=True,
-    )
-    return proc.pid
+
+    if not hasattr(os, "fork"):
+        log_fh = open(log_path, "ab")
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return proc.pid
+
+    # Pipe carries the grandchild PID (or an error string) back to the caller.
+    r_fd, w_fd = os.pipe()
+    intermediate_pid = os.fork()
+
+    if intermediate_pid > 0:
+        # Original process: reap intermediate, read daemon PID, return it.
+        os.close(w_fd)
+        try:
+            os.waitpid(intermediate_pid, 0)
+        except ChildProcessError:
+            pass
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(r_fd, 64)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        os.close(r_fd)
+        text = buf.decode("ascii", "replace").strip()
+        if text.startswith("ERROR:"):
+            raise RuntimeError(f"daemon failed to start: {text[6:].strip()}")
+        try:
+            return int(text)
+        except ValueError:
+            raise RuntimeError(f"daemon failed to start (no pid reported): {text!r}")
+
+    # Intermediate process: setsid, fork the daemon, exit.
+    try:
+        os.close(r_fd)
+        os.setsid()
+        daemon_pid = os.fork()
+        if daemon_pid > 0:
+            try:
+                os.write(w_fd, str(daemon_pid).encode())
+            finally:
+                os.close(w_fd)
+            os._exit(0)
+
+        # Grandchild: become the daemon. Redirect stdio, close inherited fds,
+        # exec the target. Past this point we must os._exit on any failure —
+        # never raise, never return to Python's caller.
+        try:
+            os.close(w_fd)
+            null_fd = os.open(os.devnull, os.O_RDONLY)
+            log_fd = os.open(
+                str(log_path),
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o644,
+            )
+            os.dup2(null_fd, 0)
+            os.dup2(log_fd, 1)
+            os.dup2(log_fd, 2)
+            os.close(null_fd)
+            os.close(log_fd)
+            try:
+                os.closerange(3, 1024)
+            except OSError:
+                pass
+            os.execvp(argv[0], argv)
+        except BaseException as e:
+            try:
+                with open(log_path, "ab") as fh:
+                    fh.write(f"[lifecycle] exec failed: {e}\n".encode())
+            except OSError:
+                pass
+            os._exit(1)
+    except BaseException as e:
+        try:
+            os.write(w_fd, f"ERROR: {type(e).__name__}: {e}".encode())
+        except OSError:
+            pass
+        os._exit(1)
 
 
 def stop(pid: int, timeout: float = 10.0) -> bool:
