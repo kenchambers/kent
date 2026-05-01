@@ -56,6 +56,17 @@ CONFIG_DIR = Path(os.environ.get("KENT_HOME", str(Path.home() / ".kent")))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 
+_README_PATH = Path(__file__).parent.parent / "README.md"
+
+
+def _find_readme() -> str | None:
+    try:
+        text = _README_PATH.read_text()
+        return text[:8000] + ("\n...[truncated]" if len(text) > 8000 else "")
+    except OSError:
+        return None
+
+
 SUPPORTED_SERVICES: dict[str, dict[str, Any]] = {
     "atlascloud": {
         "label": "Atlas Cloud",
@@ -510,6 +521,11 @@ SLASH_HELP = """\
 slash commands:
   /help                  show this list
   /tools                 list registered tools
+
+bang commands (! prefix):
+  ! view logs            tail gateway + viz log files
+
+
   /model                 show current service / model
   /clear                 clear conversation history
   /memory                show memory store info
@@ -714,6 +730,24 @@ def _handle_slash(
     return history, False
 
 
+def _show_logs() -> None:
+    logs = [
+        (CONFIG_DIR / "gateway.log", "gateway"),
+        (CONFIG_DIR / "viz.log", "viz"),
+    ]
+    found_any = False
+    for log_path, label in logs:
+        if log_path.exists():
+            found_any = True
+            lines = log_path.read_text().splitlines()
+            tail = lines[-50:] if len(lines) > 50 else lines
+            print(f"\n{_ui.header(f'{label} log')}  {_ui.c(_ui.DIM, str(log_path))}")
+            for line in tail:
+                print(f"  {_ui.c(_ui.DIM, line)}")
+    if not found_any:
+        print(_ui.c(_ui.DIM, "  no log files found in ~/.kent/"))
+
+
 def _handle_suggest(rest: str) -> None:
     """Handle /suggest, /suggest accept N, /suggest reject N."""
     from .training.scout import SuggestionStore, ACCEPTED, REJECTED
@@ -832,7 +866,7 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     print(_ui.field("Tools",   _ui.c(_ui.CYAN, ", ".join(registry.names())), label_width=7))
     print(_ui.field("Memory",  _ui.c(_ui.DIM, str(memory_store.palace_path)), label_width=7))
     print(_ui.field("Wing",    _ui.c(_ui.GOLD, memory_store.active_wing), label_width=7))
-    print("  " + _ui.c(_ui.DIM, "Type your message. /help for slash commands. /exit to quit."))
+    print("  " + _ui.c(_ui.DIM, "Type your message. /help for slash commands. ! view logs to tail logs. /exit to quit."))
     print(_ui.rule())
 
     # Scout banner: show pending suggestions at session start (cron-mode users
@@ -845,6 +879,22 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
             print(f"[scout] {n_pending} pending training suggestion{s} — /suggest to review")
     except Exception:
         pass
+
+    # Prime LLM with README context and elicit an intro greeting.
+    readme_content = _find_readme()
+    if readme_content:
+        greeting_prompt = (
+            f"<project-readme>\n{readme_content}\n</project-readme>\n\n"
+            "Greet the user with a brief welcome. Let them know you can see the project "
+            "README and can answer any questions about it. Also mention: to view logs, "
+            "they can type `! view logs` at the prompt."
+        )
+        print()
+        history, _ = await _run_once(
+            registry, llm, history, greeting_prompt,
+            quiet_tools=True, memory_store=memory_store,
+            system_prompt=system_prompt,
+        )
 
     while True:
         try:
@@ -864,6 +914,13 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
             )
             if should_exit:
                 return
+            continue
+        if user_input.startswith("!"):
+            bang_cmd = user_input[1:].strip().lower()
+            if bang_cmd == "view logs":
+                _show_logs()
+            else:
+                print(f"  unknown ! command. try: {_ui.c(_ui.BOLD, '! view logs')}")
             continue
         try:
             history, _ = await _stream_one_turn(
