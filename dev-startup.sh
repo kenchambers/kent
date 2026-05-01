@@ -439,7 +439,7 @@ PY
 
         HB_CHANNEL_ID=""
         if [ "$HB_INTERVAL" != "off" ]; then
-            printf "  Heartbeat Discord channel id (numeric, blank = skip): "
+            printf "  Heartbeat Discord channel id (numeric, blank = DM to bot owner): "
             read -r HB_CHANNEL_ID || HB_CHANNEL_ID=""
         fi
 
@@ -455,12 +455,16 @@ block["heartbeat_interval"] = interval
 if channel:
     try:
         block["heartbeat_channel_id"] = int(channel)
+        block["heartbeat_use_dm"] = False
     except ValueError:
         pass
+else:
+    block["heartbeat_use_dm"] = True
 cfg["gateway"] = block
 open(p, "w").write(json.dumps(cfg, indent=2))
 PY
-        boot_line "hb   " "heartbeat configured: interval=${HB_INTERVAL} channel=${HB_CHANNEL_ID:-<none>}" "$C_GREEN"
+        HB_DEST="${HB_CHANNEL_ID:-DM to bot owner}"
+        boot_line "hb   " "heartbeat configured: interval=${HB_INTERVAL} channel=${HB_DEST}" "$C_GREEN"
     fi
 
     if [ ! -f "$HEARTBEAT_MD" ]; then
@@ -480,7 +484,10 @@ p = sys.argv[1]
 try:
     block = (json.loads(open(p).read()).get("gateway") or {})
     interval = block.get("heartbeat_interval") or "<unset>"
-    channel = block.get("heartbeat_channel_id") or "<unset>"
+    if block.get("heartbeat_use_dm"):
+        channel = "DM to bot owner"
+    else:
+        channel = block.get("heartbeat_channel_id") or "<unset>"
     print(f"{interval}|{channel}")
 except Exception:
     print("<unset>|<unset>")

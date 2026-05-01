@@ -1718,6 +1718,7 @@ def _load_gateway_settings(args: argparse.Namespace) -> "Any":
             heartbeat_channel_id = int(heartbeat_channel_id_raw)
         except (ValueError, TypeError):
             pass
+    heartbeat_use_dm = bool(block.get("heartbeat_use_dm", False))
     return DiscordSettings(
         mention_only=mention_only,
         status=status,
@@ -1725,6 +1726,7 @@ def _load_gateway_settings(args: argparse.Namespace) -> "Any":
         log_file=Path(log_file_str),
         heartbeat_interval=heartbeat_interval,
         heartbeat_channel_id=heartbeat_channel_id,
+        heartbeat_use_dm=heartbeat_use_dm,
     )
 
 

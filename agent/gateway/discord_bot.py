@@ -48,6 +48,7 @@ class DiscordSettings:
     log_file: Path | None = None
     heartbeat_interval: str | None = None   # "30m", "off", or None (= off)
     heartbeat_channel_id: int | None = None  # channel the heartbeat runs against
+    heartbeat_use_dm: bool = False          # DM the bot owner when no channel_id set
 
 
 @dataclass
@@ -161,6 +162,7 @@ class DiscordGateway:
         self._token = token
         self._settings = settings
         self._llm_factory = llm_factory
+        self._llm = llm_factory()
         self._system_prompt_factory = system_prompt_factory
         self._store_factory = store_factory or self._default_store_factory
         self._wing_override = wing_override
@@ -362,7 +364,7 @@ class DiscordGateway:
             except Exception:
                 logger.exception("[gateway] post-ready scan failed")
 
-        self._start_heartbeat()
+        await self._start_heartbeat()
 
     def _write_status_snapshot(self) -> None:
         user = getattr(self._bot, "user", None)
@@ -492,6 +494,91 @@ class DiscordGateway:
             session.history = session.history[-150:]
 
         self._write_status_snapshot()
+
+    # ------------------------------------------------------------------
+    # Heartbeat
+    # ------------------------------------------------------------------
+
+    async def _start_heartbeat(self) -> None:
+        from .heartbeat import Heartbeat, parse_interval
+
+        interval_str = self._settings.heartbeat_interval
+        if not interval_str:
+            return
+        interval_s = parse_interval(interval_str)
+        if interval_s is None:
+            return
+
+        channel_id = self._settings.heartbeat_channel_id
+
+        if channel_id is None:
+            if not self._settings.heartbeat_use_dm:
+                logger.info("heartbeat: no channel configured — skipping")
+                return
+            try:
+                app_info = await self._bot.application_info()
+                owner = app_info.owner
+                dm_channel = await owner.create_dm()
+                channel_id = dm_channel.id
+                logger.info(
+                    "heartbeat: resolved DM channel %d for owner %s",
+                    channel_id, owner,
+                )
+            except Exception:
+                logger.exception("heartbeat: failed to resolve bot owner DM")
+                return
+
+        hb = Heartbeat(gateway=self, interval_s=interval_s, channel_id=channel_id)
+        self._heartbeat = hb.start()
+        logger.info(
+            "heartbeat: started (interval=%ds, channel=%d)", interval_s, channel_id
+        )
+
+    async def _run_heartbeat_turn(self, channel_id: int, prompt_text: str) -> None:
+        try:
+            channel = await self._bot.fetch_channel(channel_id)
+        except Exception:
+            logger.exception("heartbeat: failed to fetch channel %d", channel_id)
+            return
+
+        session = await self._session_for_channel_id(
+            channel_id, wing_name=f"discord_hb_{channel_id}"
+        )
+        assert session.store is not None and session.registry is not None
+
+        system_prompt = self._system_prompt_factory(session.store) + "\n\n" + DISCORD_SUFFIX
+        history = [*session.history, {"role": "user", "content": prompt_text}]
+        new_messages: list[dict] = []
+
+        async with session.lock:
+            try:
+                async with channel.typing():
+                    async for ev in agent_run(
+                        messages=history,
+                        tools=session.registry,
+                        llm=self._llm,
+                        system=system_prompt,
+                        max_turns=10,
+                        memory_store=session.store,
+                    ):
+                        if isinstance(ev, AssistantMessageComplete):
+                            new_messages.append(ev.message.to_openai_dict())
+                            text = (ev.message.content or "").strip()
+                            if text:
+                                for chunk in _split_for_discord(text):
+                                    if chunk:
+                                        try:
+                                            await channel.send(chunk)
+                                        except Exception:
+                                            logger.exception("heartbeat: send failed")
+                        elif isinstance(ev, Terminal):
+                            break
+            except Exception:
+                logger.exception("heartbeat turn raised (channel=%d)", channel_id)
+            finally:
+                session.history.extend(new_messages)
+                if len(session.history) > 200:
+                    session.history = session.history[-150:]
 
     async def start(self) -> None:
         await self._bot.start(self._token)
