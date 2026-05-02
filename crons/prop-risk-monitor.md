@@ -34,14 +34,16 @@ approached. It's an **emotional firewall**.
 
 | field | value |
 |---|---|
-| **ID** | `c80372b0` (replaced `6898bab7` on 2026-04-26) |
+| **Catalog ID** | `c80372b0` (registered as the planned replacement for `6898bab7` on 2026-04-26) |
 | **Name** | Prop Account Risk Monitor |
 | **Schedule** | `0 7-21/2 * * 1-5` (every 2 hours, Mon–Fri, 7 AM – 9 PM) |
 | **Timezone** | America/Chicago |
 | **Model** | `sonnet` (Sonnet 4.6) for orchestration; per-magic gatekeeper escalates to `opus` |
 | **Timeout** | 900 s |
-| **Protected** | yes — do not auto-modify or delete |
+| **Status** | **DISABLED 2026-05-02 per operator** — removed from `~/.claude/scheduled_tasks.json`. The runtime had only ever registered the predecessor `6898bab7` (the planned replacement `c80372b0` lived in the catalog but was never registered in the runtime store); `6898bab7` was the entry actually firing every 2h until disable. |
 | **Discord channel** | `1467304221362622555` |
+
+To re-enable: register the `c80372b0` entry from `cron_instructions/claude_code_crons.json` via `CronCreate` with `durable: true`.
 
 The cron prompt is short — it just runs the analyzer script, formats the
 output, and posts. All real logic lives in `scripts/prop_risk_*.py` and the
