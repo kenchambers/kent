@@ -464,7 +464,9 @@ es.onmessage = (e) => {
   // Always update the HUD so the timestamp shows we're alive.
   const n = data.nodes.length;
   document.getElementById('n').textContent = n;
-  document.getElementById('d').textContent = data.nodes.filter(nn => nn.type === 'drawer').length;
+  const drawers = data.nodes.filter(nn => nn.type === 'drawer');
+  const codeCount = drawers.filter(d => d.source_label === 'code').length;
+  document.getElementById('d').textContent = drawers.length + (codeCount > 0 ? ` (code: ${codeCount})` : '');
   document.getElementById('u').textContent = new Date().toLocaleTimeString();
 
   const errEl = document.getElementById('err');

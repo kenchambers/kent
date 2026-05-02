@@ -12,6 +12,7 @@ RESOURCE_ORDER = [
     "scope_policy",
     "query_rewrite_policy",
     "closet_summary_policy",
+    "code_query_policy",
 ]
 
 # actor_system_prompt's baseline resolves at call time from cli._SYSTEM_PROMPT_BASE
@@ -33,6 +34,10 @@ RESOURCE_BASELINES: dict[str, str] = {
     "closet_summary_policy": (
         "When writing a closet, preserve answerability of: ensure each key fact or decision "
         "can be retrieved by its natural question form."
+    ),
+    "code_query_policy": (
+        "Phrase a question to retrieve this code drawer: name the symbol, file, or behavior "
+        "the snippet implements."
     ),
     "critic_rubric": "task_success / reasoning / tool_eff / memory_use",
 }

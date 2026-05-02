@@ -74,6 +74,8 @@ async def _run_rollout_impl(
         SetWing,
         TaskStart,
         TaskEnd,
+        CodeDrawer,
+        ClosetRefresh,
     )
     from agent.builtin.tunnel_create import TunnelCreate
     from agent.loop import run as loop_run
@@ -119,6 +121,13 @@ async def _run_rollout_impl(
         registry.register(TunnelCreate())  # type: ignore[arg-type]
         registry.register(TaskStart())  # type: ignore[arg-type]
         registry.register(TaskEnd())  # type: ignore[arg-type]
+        registry.register(CodeDrawer(scratch_palace, memory_store.active_wing))  # type: ignore[arg-type]
+        registry.register(ClosetRefresh(  # type: ignore[arg-type]
+            scratch_palace, memory_store.active_wing,
+            base_url=config.actor_base_url,
+            api_key=config.actor_api_key,
+            model=config.actor_model,
+        ))
 
         system = actor_system if actor_system else _build_system_prompt(memory_store)
 
@@ -261,9 +270,13 @@ def build_recall_game_apo_agent():
         if isinstance(task, dict):
             drawer_text = str(task.get("drawer_text", ""))
             palace_path = str(task.get("palace_path", ""))
+            task_wing = task.get("wing") or None
+            task_room = task.get("room") or None
         else:
             drawer_text = str(task)
             palace_path = ""
+            task_wing = None
+            task_room = None
 
         instruction = (prompt_template.template or "").strip() or (
             "Phrase a question whose answer is in this drawer content."
@@ -307,7 +320,12 @@ def build_recall_game_apo_agent():
 
         try:
             layer3 = Layer3(palace_path)
-            results = layer3.search_raw(query, n_results=1) or []
+            search_kwargs: dict = {"n_results": 1}
+            if task_wing:
+                search_kwargs["wing"] = task_wing
+            if task_room:
+                search_kwargs["room"] = task_room
+            results = layer3.search_raw(query, **search_kwargs) or []
             similarity = float(results[0].get("similarity", 0.0)) if results else 0.0
             # Map [-1, 1] cosine similarity into [0, 1] for APO.
             reward = max(0.0, min(1.0, (similarity + 1.0) / 2.0))
@@ -328,3 +346,101 @@ def build_recall_game_apo_agent():
         return reward
 
     return recall_game_rollout
+
+
+def build_code_query_apo_agent():
+    """LitAgent for APO training of `code_query_policy`.
+
+    Task dict: {"drawer_text": str, "palace_path": str, "wing": str|None, "room": str|None}.
+    Samples drawers where room=="code" (or source_label=="code"). Reward: cosine sim of
+    generated query → source code drawer via Layer3.search_raw(room="code", n_results=1).
+    """
+    import agentlightning as agl
+
+    @agl.rollout
+    async def code_query_rollout(
+        task: Any, prompt_template: agl.PromptTemplate, rollout: agl.Rollout
+    ) -> float:
+        import time as _time
+        from agent.llm import OpenAICompatibleLLM
+        from agent.events import TextDelta
+        from mempalace.layers import Layer3
+
+        _t0 = _time.monotonic()
+        config = get_active_config()
+
+        if isinstance(task, dict):
+            drawer_text = str(task.get("drawer_text", ""))
+            palace_path = str(task.get("palace_path", ""))
+            task_wing = task.get("wing") or None
+        else:
+            drawer_text = str(task)
+            palace_path = ""
+            task_wing = None
+
+        instruction = (prompt_template.template or "").strip() or (
+            "Phrase a question to retrieve this code drawer: name the symbol, file, "
+            "or behavior the snippet implements."
+        )
+        prompt = (
+            f"{instruction}\n\n"
+            f"Code drawer content:\n{drawer_text[:600]}\n\n"
+            "Output one short retrieval query, no preamble."
+        )
+
+        actor_llm = OpenAICompatibleLLM(
+            base_url=config.actor_base_url,
+            api_key=config.actor_api_key,
+            model=config.actor_model,
+        )
+
+        parts: list[str] = []
+        try:
+            async for ev in actor_llm.stream(
+                [{"role": "user", "content": prompt}],
+                tools=[],
+                system=None,
+            ):
+                if isinstance(ev, TextDelta):
+                    parts.append(ev.text)
+        except Exception:
+            logger.exception("code-query actor call failed")
+            try:
+                agl.emit_reward(0.0)
+            except Exception:
+                pass
+            return 0.0
+
+        query = "".join(parts).strip().split("\n")[0][:200]
+        if not query or not palace_path:
+            try:
+                agl.emit_reward(0.0)
+            except Exception:
+                pass
+            return 0.0
+
+        try:
+            layer3 = Layer3(palace_path)
+            search_kwargs: dict = {"n_results": 1, "room": "code"}
+            if task_wing:
+                search_kwargs["wing"] = task_wing
+            results = layer3.search_raw(query, **search_kwargs) or []
+            similarity = float(results[0].get("similarity", 0.0)) if results else 0.0
+            reward = max(0.0, min(1.0, (similarity + 1.0) / 2.0))
+        except Exception:
+            logger.exception("code-query search failed")
+            reward = 0.0
+
+        try:
+            agl.emit_object({"query": query, "reward": reward})
+            agl.emit_reward(reward)
+        except Exception:
+            logger.debug("agl emission failed", exc_info=True)
+
+        logger.info(
+            "[code-query-rollout] query=%r reward=%.3f elapsed=%.1fs",
+            query, reward, _time.monotonic() - _t0,
+        )
+        return reward
+
+    return code_query_rollout

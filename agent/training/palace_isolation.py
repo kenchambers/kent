@@ -47,6 +47,12 @@ def snapshot(kent_home: Path, palace_path: Path) -> tuple[str, Path]:
     else:
         (scratch / "active_wing.txt").write_text("default\n")
 
+    # Copy tunnels.json for inspection/assertion; rollout TunnelCreate is a no-op
+    # during training (see rollout.py), so this file is read-only in the scratch.
+    tunnels_src = Path.home() / ".mempalace" / "tunnels.json"
+    if tunnels_src.exists():
+        shutil.copy2(tunnels_src, scratch / "tunnels.json")
+
     return rollout_id, scratch
 
 
@@ -75,3 +81,9 @@ def assert_isolation(kent_home: Path, palace_path: Path, scratch: Path) -> None:
                 if src_diary.stat().st_ino == dst_diary.stat().st_ino:
                     raise IsolationError(f"Diary {rel} must not be hardlinked from base diaries")
                 break
+
+    src_tunnels = Path.home() / ".mempalace" / "tunnels.json"
+    dst_tunnels = scratch / "tunnels.json"
+    if src_tunnels.exists() and dst_tunnels.exists():
+        if src_tunnels.stat().st_ino == dst_tunnels.stat().st_ino:
+            raise IsolationError("tunnels.json must not be hardlinked from base mempalace")

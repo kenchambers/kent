@@ -13,6 +13,8 @@ from agent.builtin.memory_recall_here import MemoryRecallHere
 from agent.builtin.diary_write import DiaryWrite
 from agent.builtin.set_wing import SetWing
 from agent.builtin.tunnel_create import TunnelCreate
+from agent.builtin.code_drawer import CodeDrawer
+from agent.builtin.closet_refresh import ClosetRefresh
 from agent.loop import run as agent_run
 from agent.memory.mempalace_store import MemPalaceStore
 
@@ -91,6 +93,20 @@ class ChatSession:
         reg.register(DiaryWrite(self.store))
         reg.register(SetWing(self.store))
         reg.register(TunnelCreate())
+        reg.register(CodeDrawer(self.store.palace_path, self.store.active_wing))
+        base_url = api_key = model = None
+        try:
+            client = getattr(self.llm, "client", None)
+            if client is not None:
+                base_url = str(getattr(client, "base_url", "")) or None
+                api_key = getattr(client, "api_key", None) or None
+            model = getattr(self.llm, "model", None)
+        except Exception:
+            pass
+        reg.register(ClosetRefresh(
+            self.store.palace_path, self.store.active_wing,
+            base_url=base_url, api_key=api_key, model=model,
+        ))
         return reg
 
 

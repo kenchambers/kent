@@ -44,6 +44,24 @@ class TunnelCreate:
         return False
 
     async def call(self, args: Args, ctx: "ToolContext") -> ToolResult:
+        # During training rollouts, mempalace.palace_graph._TUNNEL_FILE is hardcoded
+        # at module import to ~/.mempalace/tunnels.json — there's no env knob to
+        # redirect it into the rollout scratch. Short-circuit so rollouts can't
+        # leak writes into the real tunnels file.
+        try:
+            from agent.training.rollout import _active_config
+            if _active_config is not None:
+                endpoints = (
+                    f"{args.source_wing}/{args.source_room} ↔ "
+                    f"{args.target_wing}/{args.target_room}"
+                )
+                return ToolResult(
+                    call_id="",
+                    output=f"[tunnel] (training no-op) {endpoints}",
+                )
+        except Exception:
+            pass
+
         try:
             from mempalace.palace_graph import create_tunnel
         except ImportError:

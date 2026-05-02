@@ -84,15 +84,21 @@ def build_snapshot(palace_path: Path, kent_home: Path) -> dict:
         seen_wing_ids = {n["id"] for n in nodes if n["type"] == "wing"}
 
         for did, meta in zip(ids, metas):
-            kind_color = {
-                "OBSERVATION": "#5af", "FINDING": "#5f8",
-                "DECISION": "#fa5", "PATTERN": "#a5f",
-            }.get((meta or {}).get("kind", ""), "#bbb")
-            imp = float((meta or {}).get("importance", 1.0))
+            source_label = (meta or {}).get("source_label", "")
+            if source_label == "code":
+                kind_color = "#fc6"
+                val_boost = 0.3
+            else:
+                kind_color = {
+                    "OBSERVATION": "#5af", "FINDING": "#5f8",
+                    "DECISION": "#fa5", "PATTERN": "#a5f",
+                }.get((meta or {}).get("kind", ""), "#bbb")
+                val_boost = float((meta or {}).get("importance", 1.0)) * 0.4
             nodes.append(_stamp_first_seen({
                 "id": f"drawer:{did}", "type": "drawer",
                 "label": (meta or {}).get("topic") or did[:8],
-                "color": kind_color, "val": 1.0 + imp * 0.4,
+                "color": kind_color, "val": 1.0 + val_boost,
+                "source_label": source_label,
             }))
             room = (meta or {}).get("room") or ""
             wing = (meta or {}).get("wing") or ""
@@ -125,9 +131,12 @@ def build_snapshot(palace_path: Path, kent_home: Path) -> dict:
             closets_col = get_closets_collection(str(palace_path), create=False)
             cb = closets_col.get(include=["documents", "metadatas"], limit=DRAWER_HARD_CAP)
             for cid, doc in zip(cb.get("ids") or [], cb.get("documents") or []):
+                first_line = (doc or "").splitlines()[:1]
+                topic = first_line[0].split("|", 1)[0].strip() if first_line else ""
+                label = topic[:40] or "closet"
                 nodes.append(_stamp_first_seen({
                     "id": f"closet:{cid}", "type": "closet",
-                    "label": (doc or "")[:40], "color": "#aaa", "val": 0.7,
+                    "label": label, "color": "#aaa", "val": 0.7,
                 }))
                 for line in (doc or "").splitlines():
                     arrow = line.find("→")
