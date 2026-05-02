@@ -68,6 +68,10 @@ async def run(
     signal: asyncio.Event | None = None,
     expose_tool_errors: bool = False,
     memory_store: "MemoryStore | None" = None,
+    parent_session_id: str = "unknown",
+    current_task_id: str | None = None,
+    depth: int = 0,
+    parent_abort_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[Any, None]:
     """
     Stream agent events until a Terminal event.
@@ -114,7 +118,13 @@ async def run(
             yield TurnStart(turn=state.turn)
 
             # Phase 2: stream model + start tools as they arrive
-            executor = StreamingExecutor(tools, can_use_tool, signal, expose_tool_errors)
+            executor = StreamingExecutor(
+                tools, can_use_tool, signal, expose_tool_errors,
+                parent_session_id=parent_session_id,
+                current_task_id=current_task_id,
+                depth=depth,
+                parent_abort_event=parent_abort_event,
+            )
             assistant_msg = None
             api_error = None
             results: list[Message] = []

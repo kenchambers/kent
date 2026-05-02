@@ -19,6 +19,7 @@ from . import lifecycle as _lc
 from ..events import AssistantMessageComplete, ModelError, Terminal
 from ..llm import OpenAICompatibleLLM
 from ..loop import run as agent_run
+from ..orchestration import INBOX, REGISTRY
 from ..tools import ToolRegistry
 
 if TYPE_CHECKING:
@@ -61,6 +62,9 @@ class ChannelSession:
     # Track the Discord message ID we most recently responded to in this channel.
     # Used by the post-ready gap scanner to find missed messages.
     last_response_id: int | None = None  # type: ignore[assignment]
+    # Per-channel notifier task — surfaces background <task-notification>s to the
+    # channel between user turns. Started lazily in _session_for_channel_id.
+    notifier: asyncio.Task | None = None
 
 
 def _wing_for_channel(message: Any) -> str:
@@ -122,6 +126,7 @@ def _build_discord_registry(
     *,
     llm: Any,
     memory_store: "MemPalaceStore",
+    system_prompt: str | None = None,
 ) -> ToolRegistry:
     """Build a ToolRegistry containing standard kent tools + Discord tools."""
     from ..builtin.diary_write import DiaryWrite
@@ -134,7 +139,10 @@ def _build_discord_registry(
     from ..builtin.memory_recall_here import MemoryRecallHere
     from ..builtin.set_wing import SetWing
     from ..builtin.shell import Shell
+    from ..builtin.shell_spawn import ShellSpawn
     from ..builtin.spawn import Spawn
+    from ..builtin.task_status import TaskStatus
+    from ..builtin.task_stop import TaskStop
     from ..builtin.tunnel_create import TunnelCreate
     from ..builtin.web_fetch import WebFetch
     from ..builtin.web_search import WebSearch
@@ -143,7 +151,9 @@ def _build_discord_registry(
     registry.register(WebSearch())
     registry.register(WebFetch())
     registry.register(Shell())
-    registry.register(Spawn(parent_registry=registry, llm=llm, memory_store=memory_store))
+    registry.register(ShellSpawn())
+    registry.register(TaskStatus())
+    registry.register(TaskStop())
     registry.register(MemoryRecall(memory_store))
     registry.register(MemoryRecallHere(memory_store))
     registry.register(DiaryWrite(memory_store))
@@ -155,7 +165,30 @@ def _build_discord_registry(
     registry.register(DiscordThreadCreate(bot=bot, default_channel_id=default_channel_id))
     registry.register(DiscordSetStatus(bot=bot))
     registry.register(DiscordReadHistory(bot=bot, default_channel_id=default_channel_id))
+
+    # Spawn registered last so it can hand the *full* registry (including Discord
+    # tools and itself) to each subagent for recursive delegation.
+    registry.register(Spawn(
+        parent_registry=registry, llm=llm, memory_store=memory_store,
+        system_prompt=system_prompt,
+    ))
     return registry
+
+
+def _channel_session_id(channel_id: int) -> str:
+    return f"discord:{channel_id}"
+
+
+def _extract_xml_field(content: str, tag: str) -> str:
+    open_tag = f"<{tag}>"
+    close_tag = f"</{tag}>"
+    i = content.find(open_tag)
+    if i < 0:
+        return ""
+    j = content.find(close_tag, i + len(open_tag))
+    if j < 0:
+        return ""
+    return content[i + len(open_tag): j]
 
 
 class DiscordGateway:
@@ -411,13 +444,55 @@ class DiscordGateway:
                 store.set_active_wing(wing)
             except ValueError:
                 logger.warning("invalid wing %r — falling back to default", wing)
+            sys_prompt = self._system_prompt_factory(store) + "\n\n" + DISCORD_SUFFIX
             registry = _build_discord_registry(
-                self._bot, cid, llm=self._llm, memory_store=store
+                self._bot, cid, llm=self._llm, memory_store=store,
+                system_prompt=sys_prompt,
             )
             sess = ChannelSession(wing=wing, store=store, registry=registry)
+            sess.notifier = asyncio.create_task(
+                self._channel_notifier(cid, _channel_session_id(cid))
+            )
             self._sessions[cid] = sess
             self._write_status_snapshot()
             return sess
+
+    async def _channel_notifier(self, channel_id: int, session_id: str) -> None:
+        """Per-channel proactive notifier.
+
+        Surfaces task completions to the channel between user turns. Peeks the
+        inbox without consuming so the next user turn's drain still feeds the
+        notifications back into the LLM as user-role messages.
+        """
+        seen: set[int] = set()
+        while True:
+            try:
+                await INBOX.wait_for_any(session_id)
+            except asyncio.CancelledError:
+                return
+            try:
+                channel = await self._bot.fetch_channel(channel_id)
+            except Exception:
+                # Channel went away — stop notifying.
+                return
+            for msg in INBOX.peek(session_id):
+                mid = id(msg)
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                content = msg.get("content", "")
+                tid = _extract_xml_field(content, "task-id")
+                status = _extract_xml_field(content, "status")
+                summary = _extract_xml_field(content, "summary")
+                line = f"task `{tid}` {status}"
+                if summary:
+                    line += f" — {summary[:80]}"
+                try:
+                    await channel.send(line)
+                except Exception:
+                    logger.exception("notifier: send failed for channel %d", channel_id)
+            await asyncio.sleep(0)
+
 
     async def _session_for(self, message: Any) -> ChannelSession:
         cid = int(message.channel.id)
@@ -465,8 +540,16 @@ class DiscordGateway:
 
         system_prompt = self._system_prompt_factory(session.store) + "\n\n" + DISCORD_SUFFIX
 
-        history = [*session.history, {"role": "user", "content": user_text}]
+        # Drain pending background-task notifications BEFORE the new user turn.
+        cid = int(message.channel.id)
+        session_id = _channel_session_id(cid)
+        pending_msgs, drained_ids = INBOX.drain(session_id)
+        for tid in drained_ids:
+            REGISTRY.drop(tid)
+
+        history = [*session.history, *pending_msgs, {"role": "user", "content": user_text}]
         new_messages: list[dict] = []
+        new_messages.extend(pending_msgs)
         sent_any_text = False
         terminal_reason: str | None = None
 
@@ -494,6 +577,8 @@ class DiscordGateway:
                     system=system_prompt,
                     max_turns=25,
                     memory_store=session.store,
+                    parent_session_id=session_id,
+                    depth=0,
                 ):
                     if isinstance(ev, AssistantMessageComplete):
                         new_messages.append(ev.message.to_openai_dict())
@@ -586,9 +671,14 @@ class DiscordGateway:
         )
         assert session.store is not None and session.registry is not None
 
+        session_id = _channel_session_id(channel_id)
+        pending_msgs, drained_ids = INBOX.drain(session_id)
+        for tid in drained_ids:
+            REGISTRY.drop(tid)
+
         system_prompt = self._system_prompt_factory(session.store) + "\n\n" + DISCORD_SUFFIX
-        history = [*session.history, {"role": "user", "content": prompt_text}]
-        new_messages: list[dict] = []
+        history = [*session.history, *pending_msgs, {"role": "user", "content": prompt_text}]
+        new_messages: list[dict] = list(pending_msgs)
 
         async with session.lock:
             try:
@@ -600,6 +690,8 @@ class DiscordGateway:
                         system=system_prompt,
                         max_turns=10,
                         memory_store=session.store,
+                        parent_session_id=session_id,
+                        depth=0,
                     ):
                         if isinstance(ev, AssistantMessageComplete):
                             new_messages.append(ev.message.to_openai_dict())
@@ -630,6 +722,13 @@ class DiscordGateway:
                 await self._heartbeat
             except (asyncio.CancelledError, Exception):
                 pass
+        for sess in list(self._sessions.values()):
+            if sess.notifier is not None and not sess.notifier.done():
+                sess.notifier.cancel()
+                try:
+                    await sess.notifier
+                except (asyncio.CancelledError, Exception):
+                    pass
         await self._bot.close()
 
 

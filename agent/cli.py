@@ -31,6 +31,9 @@ from typing import Any, TYPE_CHECKING
 
 from . import _ui
 from .builtin.shell import Shell, detect_shell_backend
+from .builtin.shell_spawn import ShellSpawn
+from .builtin.task_status import TaskStatus
+from .builtin.task_stop import TaskStop
 from .builtin._executors import WSLExecutor, default_executor
 from .builtin.spawn import Spawn
 from .builtin.web_fetch import WebFetch
@@ -46,6 +49,7 @@ from .events import (
 )
 from .llm import LLM, OpenAICompatibleLLM
 from .loop import run
+from .orchestration import INBOX, REGISTRY
 from .tools import ToolRegistry
 
 if TYPE_CHECKING:
@@ -82,7 +86,10 @@ _SYSTEM_PROMPT_BASE = (
     "You are kent, a terminal AI agent. You have these tools: "
     "web_search (DuckDuckGo HTML, no API key), web_fetch (URL → markdown), "
     "shell (host shell — bash on macOS/Linux/WSL, PowerShell on Windows), "
-    "spawn_subagent (delegate a focused subtask), "
+    "shell_spawn (run a shell command in the background; read incremental output via task_status), "
+    "spawn_subagent (delegate a subtask to a background subagent), "
+    "task_status (list background tasks or read a specific one's output), "
+    "task_stop (signal a background task to abort; cascades to descendants by default), "
     "memory_recall (search long-term memory from previous sessions), "
     "memory_recall_here (search the active project wing's diary), "
     "diary_write (record observations, findings, decisions, patterns), "
@@ -96,6 +103,14 @@ _SYSTEM_PROMPT_BASE = (
     "Use tunnel_create when two memories belong together — it makes the connection visible "
     "in the palace graph and persists across sessions. "
     "Keep responses concise."
+    "\n\n"
+    "Background tasks: spawn_subagent and shell_spawn return immediately with a task id "
+    "(t-... for subagents, s-... for shells). The work continues in the background and its "
+    "result will arrive on a later turn as a <task-notification> user message. "
+    "If the user's request has independent subtasks, prefer to spawn_subagent them in parallel. "
+    "If a spawned worker's task is itself complex, the worker is free to spawn its own children — "
+    "but stop recursing when the work is small enough to do directly. "
+    "Do not block waiting for spawned tasks; finish your current turn and let notifications drive the next one."
 )
 
 # Kept for backward compatibility with external imports
@@ -374,6 +389,9 @@ def build_registry() -> ToolRegistry:
     registry.register(WebSearch())
     registry.register(WebFetch())
     registry.register(Shell(executor=_build_shell_executor()))
+    registry.register(ShellSpawn(executor=_build_shell_executor()))
+    registry.register(TaskStatus())
+    registry.register(TaskStop())
     return registry
 
 
@@ -415,8 +433,18 @@ async def _run_once(
     memory_store: "MemoryStore | None" = None,
     system_prompt: str = _SYSTEM_PROMPT_BASE,
     collector: "Any | None" = None,
+    parent_session_id: str = "repl",
 ) -> tuple[list[dict], str]:
     """Single agent turn. Returns (new_history, terminal_reason)."""
+    # Drain pending background-task notifications BEFORE the user's new turn so the
+    # model sees them as user-role messages prepended to history. Each drained id
+    # is dropped from the registry — that's the self-destruct point.
+    pending_msgs, drained_ids = INBOX.drain(parent_session_id)
+    if pending_msgs:
+        history = [*history, *pending_msgs]
+    for tid in drained_ids:
+        REGISTRY.drop(tid)
+
     history = [*history, {"role": "user", "content": user_input}]
     new_messages: list[dict] = []
     terminal_reason = "completed"
@@ -435,6 +463,8 @@ async def _run_once(
             system=system_prompt,
             max_turns=15,
             memory_store=memory_store,
+            parent_session_id=parent_session_id,
+            depth=0,
         ):
             if collector is not None:
                 collector.observe(ev)
@@ -485,6 +515,7 @@ async def _stream_one_turn(
     memory_store: "MemoryStore | None" = None,
     system_prompt: str = _SYSTEM_PROMPT_BASE,
     collector: "Any | None" = None,
+    parent_session_id: str = "repl",
 ) -> tuple[list[dict], str]:
     """
     Run one turn; if a critic is provided and the turn completed cleanly,
@@ -494,6 +525,7 @@ async def _stream_one_turn(
         registry, llm, history, user_input,
         quiet_tools=quiet_tools, memory_store=memory_store,
         system_prompt=system_prompt, collector=collector,
+        parent_session_id=parent_session_id,
     )
     if critic_llm is None or reason != "completed":
         return history, reason
@@ -512,6 +544,7 @@ async def _stream_one_turn(
         registry, llm, history, injected,
         quiet_tools=quiet_tools, memory_store=memory_store,
         system_prompt=system_prompt, collector=collector,
+        parent_session_id=parent_session_id,
     )
 
 
@@ -809,6 +842,61 @@ def _handle_suggest(rest: str) -> None:
 
 # ---------- subcommands ---------------------------------------------------- #
 
+async def _read_input_with_notifications(prompt: str, *, parent_session_id: str) -> str:
+    """Read a line from stdin off the event-loop thread, surfacing one-line task
+    completion banners as they arrive — without consuming them. Notifications stay
+    in the inbox so the next agent turn drains them and the LLM sees them too.
+    """
+    input_task = asyncio.create_task(asyncio.to_thread(input, prompt))
+    seen: set[int] = set()
+    while True:
+        wait_task = asyncio.create_task(INBOX.wait_for_any(parent_session_id))
+        done, _pending = await asyncio.wait(
+            {input_task, wait_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if input_task in done:
+            wait_task.cancel()
+            try:
+                await wait_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            return input_task.result()
+        # Inbox fired — print any not-yet-seen completion banners, leave them queued.
+        wait_task.cancel()
+        try:
+            await wait_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        for msg in INBOX.peek(parent_session_id):
+            mid = id(msg)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            content = msg.get("content", "")
+            tid = _extract_xml_field(content, "task-id")
+            status = _extract_xml_field(content, "status")
+            summary = _extract_xml_field(content, "summary")
+            print()
+            print(_ui.info_line(
+                f"task {tid} {status}",
+                summary[:80] if summary else "",
+            ))
+            print(prompt, end="", flush=True)
+
+
+def _extract_xml_field(content: str, tag: str) -> str:
+    """Tiny helper to pull a single tag's text from a notification body."""
+    open_tag = f"<{tag}>"
+    close_tag = f"</{tag}>"
+    i = content.find(open_tag)
+    if i < 0:
+        return ""
+    j = content.find(close_tag, i + len(open_tag))
+    if j < 0:
+        return ""
+    return content[i + len(open_tag): j]
+
+
 async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> None:
     from .memory import MemPalaceStore
     from .builtin.memory_recall import MemoryRecall
@@ -828,7 +916,6 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
             print(f"[warning] invalid --wing value: {e}")
 
     registry = build_registry()
-    registry.register(Spawn(parent_registry=registry, llm=llm, memory_store=memory_store))
     registry.register(MemoryRecall(memory_store))
     registry.register(MemoryRecallHere(memory_store))
     registry.register(DiaryWrite(memory_store))
@@ -836,6 +923,10 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     registry.register(TunnelCreate())
 
     system_prompt = _build_system_prompt(memory_store)
+    registry.register(Spawn(
+        parent_registry=registry, llm=llm, memory_store=memory_store,
+        system_prompt=system_prompt,
+    ))
 
     # Scout: opt in via KENT_SCOUT_ENABLED=1
     scout_enabled = os.environ.get("KENT_SCOUT_ENABLED", "").strip() in ("1", "true", "yes")
@@ -897,10 +988,13 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
 
     while True:
         try:
-            user_input = input("\n" + _ui.prompt()).strip()
+            user_input = await _read_input_with_notifications(
+                "\n" + _ui.prompt(), parent_session_id="repl"
+            )
         except (EOFError, KeyboardInterrupt):
             print("\n" + _ui.c(_ui.DIM, "bye."))
             return
+        user_input = user_input.strip()
         if not user_input:
             continue
         if user_input.startswith("/"):
@@ -919,6 +1013,7 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
                 registry, llm, history, user_input,
                 critic_llm=critic_llm, memory_store=memory_store,
                 system_prompt=system_prompt, collector=collector,
+                parent_session_id="repl",
             )
         except KeyboardInterrupt:
             print("\n" + _ui.info_line("interrupted", ""))
@@ -1002,7 +1097,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"[warning] invalid --wing value: {e}", file=sys.stderr)
 
     registry = build_registry()
-    registry.register(Spawn(parent_registry=registry, llm=llm, memory_store=memory_store))
     registry.register(MemoryRecall(memory_store))
     registry.register(MemoryRecallHere(memory_store))
     registry.register(DiaryWrite(memory_store))
@@ -1010,6 +1104,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     registry.register(TunnelCreate())
 
     system_prompt = _build_system_prompt(memory_store)
+    registry.register(Spawn(
+        parent_registry=registry, llm=llm, memory_store=memory_store,
+        system_prompt=system_prompt,
+    ))
 
     history: list[dict] = []
     recalled = memory_store.wake_up_full()
@@ -1021,6 +1119,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             registry, llm, history, args.prompt,
             critic_llm=critic_llm, quiet_tools=args.quiet,
             memory_store=memory_store, system_prompt=system_prompt,
+            parent_session_id="run",
         )
         return reason
 

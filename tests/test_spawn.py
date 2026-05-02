@@ -1,16 +1,52 @@
+"""Tests for the non-blocking, recursion-enabled Spawn tool.
+
+Spawn now returns ``<spawned id='t-...'>`` synchronously and runs the worker
+in ``asyncio.create_task``. Workers post a ``<task-notification>`` to the
+parent's inbox on completion. The parent's next turn drains and drops it.
+"""
 import asyncio
+import re
+
 import pytest
 from pydantic import BaseModel
-from agent import run, ToolRegistry, ToolResult, Terminal, ToolContext
+
+from agent import ToolRegistry, ToolResult, ToolContext
 from agent.events import (
-    TextDelta, ToolCallComplete, AssistantMessageComplete, AssistantMessage, ToolCall,
-    ToolResult as ToolResultEv,
+    AssistantMessage,
+    AssistantMessageComplete,
+    TextDelta,
+    ToolCall,
+    ToolCallComplete,
 )
-from agent.builtin.spawn import Spawn
+from agent.builtin.spawn import (
+    MAX_SPAWN_DEPTH,
+    MAX_TASKS_PER_SESSION,
+    Spawn,
+)
+from agent.orchestration import INBOX, REGISTRY
+
+
+SPAWNED_RE = re.compile(r"<spawned id='(t-[0-9a-f]+)'>")
+
+
+def _new_session_id() -> str:
+    """Each test gets a fresh session id so it doesn't see other tests' tasks."""
+    import secrets
+    return f"test-{secrets.token_hex(3)}"
+
+
+@pytest.fixture(autouse=True)
+def _reset_registry_inbox():
+    """Best-effort reset between tests so registry/inbox state doesn't leak."""
+    yield
+    # Drop any tasks that finished during the test.
+    for t in REGISTRY.all():
+        if t.status != "running":
+            REGISTRY.drop(t.task_id)
 
 
 class ScriptedLLM:
-    """An LLM that pops scripted turns in FIFO order. Shared between parent and subagents."""
+    """An LLM that pops scripted turns in FIFO order."""
     def __init__(self, turns):
         self._turns = list(turns)
 
@@ -35,216 +71,112 @@ class ScriptedLLM:
 
 
 @pytest.mark.asyncio
-async def test_subagent_isolation_full():
-    """Plan test #8: parent's state.messages contains the spawn call + spawn's
-    text result, NOT the subagent's internal messages."""
-
-    # Capture every turn's parent state via on_turn_end
-    parent_states = []
-
-    async def capture(state):
-        parent_states.append(state)
-
-    spawn_call = ToolCall(
-        call_id="s1",
-        name="spawn_subagent",
-        arguments={"instructions": "secret subtask"},
-    )
-
-    # Turn order: parent(turn 0) → spawn → sub(turn 0) → sub(turn 1, no tools) → parent(turn 1, no tools)
-    llm = ScriptedLLM([
-        # Parent turn 0: emits spawn call
-        {"text": "", "tool_calls": [spawn_call]},
-        # Subagent turn 0: produces secret reasoning
-        {"text": "internal subagent reasoning that should NOT bleed to parent"},
-        # Parent turn 1: produces final answer
-        {"text": "final parent answer"},
-    ])
-
+async def test_spawn_returns_immediately_with_handle():
+    """spawn.call() returns synchronously with <spawned id='t-...'> while the
+    worker runs in the background."""
+    sub_llm = ScriptedLLM([{"text": "subagent done"}])
     parent_registry = ToolRegistry()
-    spawn = Spawn(parent_registry=parent_registry, llm=llm)
+    spawn = Spawn(parent_registry=parent_registry, llm=sub_llm)
     parent_registry.register(spawn)
 
-    async for _ in run(
-        messages=[{"role": "user", "content": "delegate a thing"}],
-        tools=parent_registry,
-        llm=llm,
-        on_turn_end=capture,
-    ):
-        pass
+    session_id = _new_session_id()
+    ctx = ToolContext(parent_session_id=session_id)
+    result = await spawn.call(spawn.input_model(instructions="do thing"), ctx)
+    assert isinstance(result, ToolResult)
+    assert "<spawned id=" in str(result.output)
+    match = SPAWNED_RE.search(str(result.output))
+    assert match is not None
+    task_id = match.group(1)
 
-    # The final parent state should have:
-    #   user msg, assistant msg (with spawn tool call), tool result with subagent output
-    final_state = parent_states[-1]
-    all_content = " ".join(
-        str(m.get("content", ""))
-        for m in final_state.messages
-    )
-    # The subagent's internal reasoning text appears in the tool result content
-    # because it IS the subagent's final answer. That's expected.
-    # What MUST NOT appear is any subagent-internal message structure (separate
-    # role=user "secret subtask" instruction, separate assistant entries, etc).
-    roles = [m["role"] for m in final_state.messages]
-    # Parent should only see: user (initial), assistant (spawn call), tool (result)
-    assert roles == ["user", "assistant", "tool"]
-    # The subagent's user message ("secret subtask") must NOT appear at top level
-    user_messages = [m for m in final_state.messages if m["role"] == "user"]
-    assert len(user_messages) == 1
-    assert "secret subtask" not in str(user_messages[0]["content"])
+    # Task should be registered (running) initially.
+    t = REGISTRY.get(task_id)
+    assert t is not None
+    assert t.kind == "agent"
+    assert t.parent_session_id == session_id
+
+    # Wait briefly for the worker to finish and post its notification.
+    aio_task = t.aio_task
+    assert aio_task is not None
+    await asyncio.wait_for(aio_task, timeout=2.0)
+
+    # Inbox should now contain a <task-notification> for this task id.
+    msgs, drained_ids = INBOX.drain(session_id)
+    assert task_id in drained_ids
+    assert any("<task-notification>" in m.get("content", "") for m in msgs)
+    assert any(task_id in m.get("content", "") for m in msgs)
+
+    # Self-destruct: dropping consumed task ids removes them from the registry.
+    for tid in drained_ids:
+        REGISTRY.drop(tid)
+    assert REGISTRY.get(task_id) is None
 
 
 @pytest.mark.asyncio
-async def test_subagent_parallelism():
-    """Plan test #9: 3 spawn_subagent calls in one turn run concurrently."""
-    barrier = asyncio.Barrier(3)
-    enter_count = [0]
-
-    class BarrierTool:
-        name = "barrier"
-        description = "blocks until 3 invocations meet"
-        class Args(BaseModel): pass
-        input_model = Args
-        def is_concurrency_safe(self, args): return True
-        async def call(self, args, ctx):
-            enter_count[0] += 1
-            await barrier.wait()
-            return ToolResult(call_id="", output="passed")
-
-    spawn_calls = [
-        ToolCall(
-            call_id=f"s{i}",
-            name="spawn_subagent",
-            arguments={"instructions": f"do {i}", "tools": ["barrier"]},
-        )
-        for i in range(3)
-    ]
-
-    # Each subagent invocation:
-    #   turn 0: call barrier tool
-    #   turn 1: produce final text
-    sub_turns = []
-    for i in range(3):
-        sub_turns.extend([
-            {"text": "", "tool_calls": [ToolCall(call_id=f"b{i}", name="barrier", arguments={})]},
-            {"text": f"sub {i} done"},
-        ])
-
-    parent_turns = [
-        # Parent fires 3 spawn calls in one turn
-        {"text": "", "tool_calls": spawn_calls},
-        # After tool results return, parent finishes
-        {"text": "all subs returned"},
-    ]
-
-    # IMPORTANT: subagents and parent share the same LLM, but the order in which
-    # turns get consumed depends on scheduling. Since the parent's stream
-    # completes first and spawns the 3 subs concurrently, the 3 subs will
-    # interleave their turns. We don't care about exact interleaving — only that
-    # all 3 barrier.wait() calls enter concurrently.
-    # To handle interleaving robustly, we use a turn dispatcher keyed on the
-    # subagent's first user message ("do 0", "do 1", "do 2").
-    class Dispatcher:
-        @property
-        def context_window(self): return 100_000
-        def count_tokens(self, m): return 10
-
-        # Tracks which subagent (or parent) we're servicing based on messages
-        _parent_idx = 0
-        _sub_idx = {0: 0, 1: 0, 2: 0}
-
-        async def stream(self, messages, tools, system, *, signal=None):
-            # Detect parent vs subagent by initial user message content
-            first_user = next((m for m in messages if m["role"] == "user"), None)
-            content = first_user["content"] if first_user else ""
-
-            if content.startswith("do "):
-                sub_id = int(content.split()[-1])
-                turn_idx = self._sub_idx[sub_id]
-                if turn_idx == 0:
-                    self._sub_idx[sub_id] = 1
-                    tc = ToolCall(
-                        call_id=f"b{sub_id}", name="barrier", arguments={}
-                    )
-                    yield ToolCallComplete(call=tc)
-                    yield AssistantMessageComplete(
-                        message=AssistantMessage(content="", tool_calls=[tc])
-                    )
-                else:
-                    self._sub_idx[sub_id] = 2
-                    yield TextDelta(text=f"sub {sub_id} done")
-                    yield AssistantMessageComplete(
-                        message=AssistantMessage(content=f"sub {sub_id} done", tool_calls=[])
-                    )
-            else:
-                # Parent
-                turn = parent_turns[self._parent_idx]
-                self._parent_idx += 1
-                if turn.get("text"):
-                    yield TextDelta(text=turn["text"])
-                for tc in turn.get("tool_calls", []):
-                    yield ToolCallComplete(call=tc)
-                yield AssistantMessageComplete(
-                    message=AssistantMessage(
-                        content=turn.get("text", ""),
-                        tool_calls=turn.get("tool_calls", []),
-                    )
-                )
-
-    dispatcher = Dispatcher()
-    parent_registry = ToolRegistry()
-    barrier_tool = BarrierTool()
-    parent_registry.register(barrier_tool)
-    spawn = Spawn(parent_registry=parent_registry, llm=dispatcher)
-    parent_registry.register(spawn)
-
-    events = []
-    async for ev in run(
-        messages=[{"role": "user", "content": "delegate three"}],
-        tools=parent_registry,
-        llm=dispatcher,
-        max_turns=5,
-    ):
-        events.append(ev)
-
-    # If subagents ran serially, only one would enter the barrier and it would deadlock.
-    # The fact that we got here means all 3 entered concurrently.
-    assert enter_count[0] == 3
-    # Parent should see 3 tool results from spawn calls
-    spawn_results = [
-        e for e in events
-        if isinstance(e, ToolResultEv) and "sub" in str(e.output) and "done" in str(e.output)
-    ]
-    assert len(spawn_results) == 3
-
-
-@pytest.mark.asyncio
-async def test_subagent_no_recursive_spawn():
-    """A subagent's tool registry should not include the spawn tool itself,
-    even when the parent passes spawn_subagent in args.tools."""
+async def test_spawn_depth_cap_rejects():
+    """ctx.depth >= MAX_SPAWN_DEPTH → spawn returns an error result, no task registered."""
     parent_registry = ToolRegistry()
 
     class DummyLLM:
         @property
         def context_window(self): return 10_000
         def count_tokens(self, m): return 1
-        async def stream(self, messages, tools, system, *, signal=None):
+        async def stream(self, *args, **kw):
             yield TextDelta(text="")
             yield AssistantMessageComplete(message=AssistantMessage(content="", tool_calls=[]))
 
     spawn = Spawn(parent_registry=parent_registry, llm=DummyLLM())
     parent_registry.register(spawn)
 
-    # Even though we pass spawn_subagent in tools, the subagent's registry should exclude it
-    args = spawn.input_model(instructions="x", tools=["spawn_subagent"])
-    # We can't easily inspect the subagent's registry from outside, but
-    # we can verify by running and ensuring no infinite recursion.
-    result = await spawn.call(args, ToolContext())
-    assert isinstance(result, ToolResult)
+    ctx = ToolContext(parent_session_id=_new_session_id(), depth=MAX_SPAWN_DEPTH)
+    result = await spawn.call(spawn.input_model(instructions="x"), ctx)
+    assert result.is_error
+    assert "depth" in str(result.output).lower()
 
 
 @pytest.mark.asyncio
-async def test_spawn_default_tools_excludes_spawn():
-    """tools=None: subagent sees parent tools but not Spawn itself."""
+async def test_spawn_count_cap_rejects(monkeypatch):
+    """Once MAX_TASKS_PER_SESSION running tasks exist for a session, further spawns reject."""
+    parent_registry = ToolRegistry()
+
+    class _Slow:
+        @property
+        def context_window(self): return 10_000
+        def count_tokens(self, m): return 1
+        async def stream(self, *args, **kw):
+            # Keep the worker hanging so it stays "running" — but we cap quickly so
+            # this won't actually be reached in the test.
+            await asyncio.sleep(10)
+            yield TextDelta(text="")
+
+    spawn = Spawn(parent_registry=parent_registry, llm=_Slow())
+    parent_registry.register(spawn)
+
+    session_id = _new_session_id()
+    monkeypatch.setattr("agent.builtin.spawn.MAX_TASKS_PER_SESSION", 1)
+    # First spawn succeeds.
+    first = await spawn.call(spawn.input_model(instructions="a"), ToolContext(parent_session_id=session_id))
+    assert not first.is_error
+    # Second spawn should reject because we capped at 1.
+    second = await spawn.call(spawn.input_model(instructions="b"), ToolContext(parent_session_id=session_id))
+    assert second.is_error
+    assert "task" in str(second.output).lower()
+
+    # Cleanup: kill the running first task.
+    match = SPAWNED_RE.search(str(first.output))
+    assert match is not None
+    REGISTRY.kill(match.group(1))
+    t = REGISTRY.get(match.group(1))
+    if t is not None and t.aio_task is not None:
+        try:
+            await asyncio.wait_for(t.aio_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            t.aio_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_spawn_default_tools_inherits_full_parent_registry():
+    """tools=None now means: subagent gets the *full* parent registry, including spawn_subagent.
+    This is the recursion-enabled change vs. the previous behavior."""
     seen_tool_names: list[list[str]] = []
 
     class InspectingLLM:
@@ -253,8 +185,10 @@ async def test_spawn_default_tools_excludes_spawn():
         def count_tokens(self, m): return 1
         async def stream(self, messages, tools, system, *, signal=None):
             seen_tool_names.append([t["function"]["name"] for t in tools])
-            yield TextDelta(text="done")
-            yield AssistantMessageComplete(message=AssistantMessage(content="done", tool_calls=[]))
+            yield TextDelta(text="ok")
+            yield AssistantMessageComplete(
+                message=AssistantMessage(content="ok", tool_calls=[])
+            )
 
     class DummyTool:
         name = "dummy"
@@ -267,22 +201,30 @@ async def test_spawn_default_tools_excludes_spawn():
 
     parent_registry = ToolRegistry()
     parent_registry.register(DummyTool())
-    llm = InspectingLLM()
-    spawn = Spawn(parent_registry=parent_registry, llm=llm)
+    spawn = Spawn(parent_registry=parent_registry, llm=InspectingLLM())
     parent_registry.register(spawn)
 
-    args = spawn.input_model(instructions="do stuff")  # tools=None by default
-    await spawn.call(args, ToolContext())
+    session_id = _new_session_id()
+    result = await spawn.call(
+        spawn.input_model(instructions="do stuff"),
+        ToolContext(parent_session_id=session_id),
+    )
+    match = SPAWNED_RE.search(str(result.output))
+    assert match is not None
+    t = REGISTRY.get(match.group(1))
+    assert t is not None and t.aio_task is not None
+    await asyncio.wait_for(t.aio_task, timeout=2.0)
 
     assert seen_tool_names, "LLM was never called"
     sub_tools = seen_tool_names[0]
     assert "dummy" in sub_tools
-    assert "spawn_subagent" not in sub_tools
+    # Recursion enabled — the subagent SHOULD see spawn_subagent in its tool kit.
+    assert "spawn_subagent" in sub_tools
 
 
 @pytest.mark.asyncio
-async def test_spawn_explicit_tool_list():
-    """tools=['dummy'] gives the subagent exactly that tool."""
+async def test_spawn_explicit_tool_list_filters():
+    """tools=['dummy'] gives the subagent exactly that tool — no spawn, no others."""
     seen_tool_names: list[list[str]] = []
 
     class InspectingLLM:
@@ -292,7 +234,9 @@ async def test_spawn_explicit_tool_list():
         async def stream(self, messages, tools, system, *, signal=None):
             seen_tool_names.append([t["function"]["name"] for t in tools])
             yield TextDelta(text="ok")
-            yield AssistantMessageComplete(message=AssistantMessage(content="ok", tool_calls=[]))
+            yield AssistantMessageComplete(
+                message=AssistantMessage(content="ok", tool_calls=[])
+            )
 
     class DummyTool:
         name = "dummy"
@@ -315,20 +259,25 @@ async def test_spawn_explicit_tool_list():
     parent_registry = ToolRegistry()
     parent_registry.register(DummyTool())
     parent_registry.register(OtherTool())
-    llm = InspectingLLM()
-    spawn = Spawn(parent_registry=parent_registry, llm=llm)
+    spawn = Spawn(parent_registry=parent_registry, llm=InspectingLLM())
     parent_registry.register(spawn)
 
-    args = spawn.input_model(instructions="x", tools=["dummy"])
-    await spawn.call(args, ToolContext())
+    result = await spawn.call(
+        spawn.input_model(instructions="x", tools=["dummy"]),
+        ToolContext(parent_session_id=_new_session_id()),
+    )
+    match = SPAWNED_RE.search(str(result.output))
+    assert match is not None
+    t = REGISTRY.get(match.group(1))
+    assert t is not None and t.aio_task is not None
+    await asyncio.wait_for(t.aio_task, timeout=2.0)
 
-    sub_tools = seen_tool_names[0]
-    assert sub_tools == ["dummy"]
+    assert seen_tool_names[0] == ["dummy"]
 
 
 @pytest.mark.asyncio
 async def test_spawn_unknown_tool_in_args_silently_skipped():
-    """tools=['nonexistent'] doesn't crash; subagent gets zero tools."""
+    """tools=['nonexistent'] gives the subagent zero tools."""
     seen_tool_names: list[list[str]] = []
 
     class InspectingLLM:
@@ -338,14 +287,110 @@ async def test_spawn_unknown_tool_in_args_silently_skipped():
         async def stream(self, messages, tools, system, *, signal=None):
             seen_tool_names.append([t["function"]["name"] for t in tools])
             yield TextDelta(text="ok")
-            yield AssistantMessageComplete(message=AssistantMessage(content="ok", tool_calls=[]))
+            yield AssistantMessageComplete(
+                message=AssistantMessage(content="ok", tool_calls=[])
+            )
 
     parent_registry = ToolRegistry()
-    llm = InspectingLLM()
-    spawn = Spawn(parent_registry=parent_registry, llm=llm)
+    spawn = Spawn(parent_registry=parent_registry, llm=InspectingLLM())
     parent_registry.register(spawn)
 
-    args = spawn.input_model(instructions="x", tools=["nonexistent"])
-    result = await spawn.call(args, ToolContext())
-    assert isinstance(result, ToolResult)
+    result = await spawn.call(
+        spawn.input_model(instructions="x", tools=["nonexistent"]),
+        ToolContext(parent_session_id=_new_session_id()),
+    )
+    match = SPAWNED_RE.search(str(result.output))
+    assert match is not None
+    t = REGISTRY.get(match.group(1))
+    assert t is not None and t.aio_task is not None
+    await asyncio.wait_for(t.aio_task, timeout=2.0)
+
     assert seen_tool_names[0] == []
+
+
+@pytest.mark.asyncio
+async def test_inbox_drop_self_destructs_task():
+    """After draining a notification and calling REGISTRY.drop, the task is gone."""
+    sub_llm = ScriptedLLM([{"text": "leaf done"}])
+    parent_registry = ToolRegistry()
+    spawn = Spawn(parent_registry=parent_registry, llm=sub_llm)
+    parent_registry.register(spawn)
+
+    session_id = _new_session_id()
+    result = await spawn.call(
+        spawn.input_model(instructions="leaf"),
+        ToolContext(parent_session_id=session_id),
+    )
+    match = SPAWNED_RE.search(str(result.output))
+    assert match is not None
+    task_id = match.group(1)
+
+    t = REGISTRY.get(task_id)
+    assert t is not None and t.aio_task is not None
+    await asyncio.wait_for(t.aio_task, timeout=2.0)
+    assert t.status == "completed"
+
+    msgs, drained_ids = INBOX.drain(session_id)
+    assert task_id in drained_ids
+    for tid in drained_ids:
+        REGISTRY.drop(tid)
+    assert REGISTRY.get(task_id) is None
+
+
+@pytest.mark.asyncio
+async def test_task_stop_cascades_to_descendants():
+    """Killing a parent task signals every descendant's abort_event."""
+    parent_registry = ToolRegistry()
+
+    class _Hang:
+        @property
+        def context_window(self): return 10_000
+        def count_tokens(self, m): return 1
+        async def stream(self, *a, **k):
+            await asyncio.sleep(10)
+            yield TextDelta(text="")
+
+    spawn = Spawn(parent_registry=parent_registry, llm=_Hang())
+    parent_registry.register(spawn)
+
+    session_id = _new_session_id()
+    parent_res = await spawn.call(
+        spawn.input_model(instructions="A"),
+        ToolContext(parent_session_id=session_id),
+    )
+    parent_id = SPAWNED_RE.search(str(parent_res.output)).group(1)
+    parent_task = REGISTRY.get(parent_id)
+    assert parent_task is not None
+
+    # Spawn a child of the parent (simulating recursion). We synthesize the ctx
+    # with current_task_id=parent_id so registry knows the lineage.
+    child_res = await spawn.call(
+        spawn.input_model(instructions="B"),
+        ToolContext(
+            parent_session_id=session_id,
+            current_task_id=parent_id,
+            depth=1,
+            parent_abort_event=parent_task.abort_event,
+        ),
+    )
+    child_id = SPAWNED_RE.search(str(child_res.output)).group(1)
+    child_task = REGISTRY.get(child_id)
+    assert child_task is not None
+
+    # Kill parent with cascade=True (default).
+    REGISTRY.kill(parent_id)
+    assert parent_task.abort_event.is_set()
+    # link_child_abort propagates from parent → child via the watcher task,
+    # but the registry's own list_descendants index also signals it directly.
+    # Either way, give the event loop a tick.
+    await asyncio.sleep(0.05)
+    assert child_task.abort_event.is_set()
+
+    # Cleanup
+    for tid in (parent_id, child_id):
+        t = REGISTRY.get(tid)
+        if t is not None and t.aio_task is not None:
+            try:
+                await asyncio.wait_for(t.aio_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                t.aio_task.cancel()

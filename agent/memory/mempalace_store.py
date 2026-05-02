@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,6 +13,11 @@ if TYPE_CHECKING:
     from ..state import Message
 
 logger = logging.getLogger(__name__)
+
+# Process-global lock that serializes the mempalace `sweep()` call. Without it,
+# parallel workers writing transcripts can race on the palace store. Reads tolerate
+# slightly-stale state and don't need locking.
+_SWEEP_LOCK = threading.Lock()
 
 _TRANSCRIPT_BASE = Path(
     os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
@@ -78,9 +84,26 @@ class MemPalaceStore:
             from mempalace.sweeper import sweep
 
             append_messages(self._transcript_path, messages, session_id=session_id)
-            sweep(str(self._transcript_path), str(self._palace_path), source_label="kent")
+            with _SWEEP_LOCK:
+                sweep(str(self._transcript_path), str(self._palace_path), source_label="kent")
         except Exception:
             logger.warning("MemPalaceStore.record_turn failed", exc_info=True)
+
+    def fork(self, *, session_id: str) -> "MemPalaceStore":
+        """Return a sibling store with the given session_id.
+
+        Same palace, same kent_home, same active wing — only the session_id and
+        transcript path differ. Used by spawned subagents so they get their own
+        per-session transcript file but write to the shared palace.
+        """
+        sibling = MemPalaceStore(
+            palace_path=self._palace_path,
+            kent_home=self._kent_home,
+        )
+        sibling._session_id = session_id
+        sibling._transcript_path = _TRANSCRIPT_BASE / f"{session_id}.jsonl"
+        sibling._active_wing = self._active_wing
+        return sibling
 
     def wake_up(self) -> str:
         """Global-only wake-up. Used by compact.py — keeps compaction tokens bounded."""

@@ -9,9 +9,22 @@ from .events import ToolCall, ToolResult
 
 class ToolContext:
     """Passed to every tool.call() — extensible without breaking the protocol."""
-    def __init__(self, signal: asyncio.Event | None = None, expose_tool_errors: bool = False):
+    def __init__(
+        self,
+        signal: asyncio.Event | None = None,
+        expose_tool_errors: bool = False,
+        *,
+        parent_session_id: str = "unknown",
+        current_task_id: str | None = None,
+        depth: int = 0,
+        parent_abort_event: asyncio.Event | None = None,
+    ):
         self.signal = signal
         self.expose_tool_errors = expose_tool_errors
+        self.parent_session_id = parent_session_id
+        self.current_task_id = current_task_id
+        self.depth = depth
+        self.parent_abort_event = parent_abort_event
 
 
 class Tool(Protocol):
@@ -156,10 +169,22 @@ class StreamingExecutor:
         can_use_tool: CanUseToolFn | None,
         signal: asyncio.Event | None,
         expose_tool_errors: bool = False,
+        *,
+        parent_session_id: str = "unknown",
+        current_task_id: str | None = None,
+        depth: int = 0,
+        parent_abort_event: asyncio.Event | None = None,
     ):
         self._registry = registry
         self._can_use_tool = can_use_tool
-        self._ctx = ToolContext(signal=signal, expose_tool_errors=expose_tool_errors)
+        self._ctx = ToolContext(
+            signal=signal,
+            expose_tool_errors=expose_tool_errors,
+            parent_session_id=parent_session_id,
+            current_task_id=current_task_id,
+            depth=depth,
+            parent_abort_event=parent_abort_event,
+        )
         # Each entry: (call, task-or-None). Task is set if started eagerly.
         self._entries: list[tuple[ToolCall, asyncio.Task[ToolResult] | None]] = []
         self._streaming_open = True  # flips False once an unsafe tool is queued
