@@ -51,17 +51,23 @@ def _encode_content(msg: dict) -> Any:
     return content
 
 
-def append_messages(path: Path, messages: list[dict], *, session_id: str) -> None:
-    """Append messages to a JSONL file in Claude-Code-compatible format."""
+def append_messages(path: Path, messages: list[dict], *, session_id: str) -> list[str]:
+    """Append messages to a JSONL file in Claude-Code-compatible format.
+
+    Returns the list of UUIDs assigned to each appended message.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    uuids: list[str] = []
     with path.open("a", encoding="utf-8") as f:
         for msg in messages:
             role = msg.get("role", "user")
             rec_type = "user" if role == "tool" else role
+            msg_uuid = _new_uuid()
+            uuids.append(msg_uuid)
             record = {
                 "type": rec_type,
                 "sessionId": session_id,
-                "uuid": _new_uuid(),
+                "uuid": msg_uuid,
                 "timestamp": _now_iso(),
                 "message": {
                     "role": "user" if role == "tool" else role,
@@ -70,3 +76,4 @@ def append_messages(path: Path, messages: list[dict], *, session_id: str) -> Non
             }
             f.write(json.dumps(record) + "\n")
         f.flush()
+    return uuids

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import platform
 import sys
@@ -28,6 +29,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from . import _ui
 from .builtin.shell import Shell, detect_shell_backend
@@ -166,7 +169,7 @@ def _build_system_prompt(memory_store: "MemoryStore | None" = None) -> str:
             wing_lines.append(f"  {w}{marker}{intent_part}")
 
         overflow_note = f"\n  (and {overflow} more — use /wings)" if overflow > 0 else ""
-        return (
+        wings_block = (
             base
             + "\n\nActive project wings:\n"
             + "\n".join(wing_lines)
@@ -175,6 +178,29 @@ def _build_system_prompt(memory_store: "MemoryStore | None" = None) -> str:
             "propose set_wing(name='...') after confirming the name with the user, "
             "then call again with intent='...' to register."
         )
+
+        # Append room summary for the active wing if rooms exist
+        try:
+            from mempalace.palace import get_collection
+            col = get_collection(str(memory_store.palace_path), create=False)
+            batch = col.get(
+                where={"wing": active},
+                include=["metadatas"],
+                limit=5_000,
+            )
+            metas = batch.get("metadatas") or []
+            rooms: set[str] = set()
+            for m in metas:
+                r = (m or {}).get("room") or ""
+                if r:
+                    rooms.add(r)
+            if rooms:
+                rooms_list = ", ".join(sorted(rooms))
+                wings_block += f"\nwing '{active}' has rooms: [{rooms_list}]"
+        except Exception:
+            pass
+
+        return wings_block
     except Exception:
         return base
 
@@ -565,6 +591,8 @@ slash commands:
   /wing                  show active wing
   /wing <name>           switch to a wing (must exist)
   /wings                 list all wings with intents
+  /rooms                 list rooms in the active wing
+  /closets               rebuild closets for the active wing
   /diary <text>          record an OBSERVATION in the active wing's diary
   /suggest               list pending training suggestions (scout)
   /suggest accept <N>    accept suggestion #N and launch training
@@ -754,6 +782,62 @@ def _handle_slash(
                     print("diary not supported for this store type")
             except Exception as e:
                 print(f"  error: {e}")
+    elif head == "/rooms":
+        if memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                from mempalace.palace import get_collection
+                if isinstance(memory_store, MemPalaceStore):
+                    active = memory_store.active_wing
+                    col = get_collection(str(memory_store.palace_path), create=False)
+                    batch = col.get(
+                        where={"wing": active},
+                        include=["metadatas"],
+                        limit=10_000,
+                    )
+                    metas = batch.get("metadatas") or []
+                    room_counts: dict[str, int] = {}
+                    for m in metas:
+                        r = (m or {}).get("room") or "unknown"
+                        room_counts[r] = room_counts.get(r, 0) + 1
+                    if not room_counts:
+                        print(f"  no drawers in wing '{active}' yet")
+                    else:
+                        print(f"  rooms in wing '{active}':")
+                        for room, count in sorted(room_counts.items()):
+                            print(f"    {room}: {count} drawer(s)")
+                else:
+                    print("rooms not supported for this store type")
+            except Exception as e:
+                print(f"  error: {e}")
+    elif head == "/closets":
+        if memory_store is None:
+            print("no memory store configured")
+        else:
+            try:
+                from .memory.mempalace_store import MemPalaceStore
+                from mempalace.closet_llm import regenerate_closets, LLMConfig
+                from mempalace.palace_graph import invalidate_graph_cache
+                if isinstance(memory_store, MemPalaceStore):
+                    wing = memory_store.active_wing
+                    cfg = None
+                    if choice.base_url and choice.api_key:
+                        cfg = LLMConfig(
+                            endpoint=choice.base_url,
+                            key=choice.api_key,
+                            model=choice.model,
+                        )
+                    flavor = "LLM" if cfg else "regex"
+                    print(f"  [closets] rebuilding for wing '{wing}' ({flavor})…")
+                    regenerate_closets(str(memory_store.palace_path), wing=wing, cfg=cfg)
+                    invalidate_graph_cache()
+                    print("  [closets] done")
+                else:
+                    print("closets not supported for this store type")
+            except Exception as e:
+                print(f"  error: {e}")
     elif head.startswith("/suggest"):
         rest = cmd_stripped[len("/suggest"):].strip()
         _handle_suggest(rest)
@@ -904,6 +988,8 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     from .builtin.diary_write import DiaryWrite
     from .builtin.set_wing import SetWing
     from .builtin.tunnel_create import TunnelCreate
+    from .builtin.code_drawer import CodeDrawer
+    from .builtin.closet_refresh import ClosetRefresh
 
     llm = _make_llm(choice)
     critic_llm = _make_critic_llm(choice)
@@ -921,6 +1007,11 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
     registry.register(DiaryWrite(memory_store))
     registry.register(SetWing(memory_store))
     registry.register(TunnelCreate())
+    registry.register(CodeDrawer(memory_store.palace_path, memory_store.active_wing))
+    registry.register(ClosetRefresh(
+        memory_store.palace_path, memory_store.active_wing,
+        base_url=choice.base_url, api_key=choice.api_key, model=choice.model,
+    ))
 
     system_prompt = _build_system_prompt(memory_store)
     registry.register(Spawn(
@@ -1086,6 +1177,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     from .builtin.diary_write import DiaryWrite
     from .builtin.set_wing import SetWing
     from .builtin.tunnel_create import TunnelCreate
+    from .builtin.code_drawer import CodeDrawer
+    from .builtin.closet_refresh import ClosetRefresh
 
     memory_store = MemPalaceStore()
 
@@ -1102,6 +1195,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     registry.register(DiaryWrite(memory_store))
     registry.register(SetWing(memory_store))
     registry.register(TunnelCreate())
+    registry.register(CodeDrawer(memory_store.palace_path, memory_store.active_wing))
+    registry.register(ClosetRefresh(
+        memory_store.palace_path, memory_store.active_wing,
+        base_url=choice.base_url, api_key=choice.api_key, model=choice.model,
+    ))
 
     system_prompt = _build_system_prompt(memory_store)
     registry.register(Spawn(
@@ -1312,6 +1410,14 @@ def cmd_train_run(args: argparse.Namespace) -> int:
 
         set_active_config(config)
         try:
+            from .training.rollout import (
+                build_recall_game_apo_agent,
+                build_code_query_apo_agent,
+            )
+            agent_builder = {
+                "query_rewrite_policy": build_recall_game_apo_agent,
+                "code_query_policy": build_code_query_apo_agent,
+            }.get(resource)
             metrics = train_resource(
                 resource_name=resource,
                 train_dataset=train_examples,
@@ -1323,6 +1429,7 @@ def cmd_train_run(args: argparse.Namespace) -> int:
                 apo_base_url=apo_base_url,
                 gradient_model=gradient_model,
                 apply_edit_model=apply_edit_model,
+                agent_builder=agent_builder,
             )
         finally:
             set_active_config(None)
@@ -1510,6 +1617,157 @@ def cmd_train_auto(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_index(args: argparse.Namespace) -> int:
+    """Walk a working tree and ingest source files as code drawers into the palace."""
+    import fnmatch
+    from .memory.mempalace_store import _DEFAULT_PALACE, _DEFAULT_KENT_HOME
+
+    root = Path(args.path).expanduser().resolve()
+    if not root.exists():
+        print(f"path not found: {root}", file=sys.stderr)
+        return 2
+
+    palace_path = _DEFAULT_PALACE
+    kent_home = _DEFAULT_KENT_HOME
+
+    from .memory.wings import read_active_wing, write_active_wing, sanitize_wing
+    active_wing = read_active_wing(home=kent_home)
+
+    if getattr(args, "set_wing", False):
+        try:
+            from mempalace.project_scanner import scan
+            projects, _ = scan(root)
+            if projects:
+                wing_name = sanitize_wing(projects[0].name)
+                write_active_wing(wing_name, home=kent_home)
+                active_wing = wing_name
+                print(f"[index] active wing set to: {active_wing}")
+        except Exception as e:
+            logger.warning("project scan failed: %s", e)
+
+    SKIP_DIRS = {
+        ".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules",
+        ".tox", "dist", "build", ".eggs", "*.egg-info",
+    }
+    TEXT_EXTENSIONS = {
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c", ".cpp",
+        ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".sh", ".bash",
+        ".zsh", ".fish", ".toml", ".yaml", ".yml", ".json", ".md", ".txt",
+        ".html", ".css", ".sql", ".lua", ".r", ".scala", ".ex", ".exs",
+    }
+
+    from .builtin.code_drawer import CodeDrawer
+    drawer = CodeDrawer(palace_path, active_wing)
+
+    indexed = 0
+    skipped = 0
+    for src in root.rglob("*"):
+        if not src.is_file():
+            continue
+        # Skip hidden and excluded dirs
+        parts = src.relative_to(root).parts
+        skip = False
+        for part in parts[:-1]:
+            if part.startswith(".") or any(fnmatch.fnmatch(part, p) for p in SKIP_DIRS):
+                skip = True
+                break
+        if skip:
+            skipped += 1
+            continue
+        if src.suffix not in TEXT_EXTENSIONS:
+            skipped += 1
+            continue
+
+        room = src.parent.name if src.parent != root else "root"
+
+        class _FakeArgs:
+            path = str(src)
+            language = src.suffix.lstrip(".") or None
+            wing = active_wing
+            room = room
+
+        class _FakeCtx:
+            pass
+
+        import asyncio as _asyncio
+
+        async def _do(s=src, r=room):
+            return await drawer.call(_FakeArgs(), _FakeCtx())  # type: ignore[arg-type]
+
+        result = _asyncio.run(_do())
+        if result.is_error:
+            logger.warning("code_drawer error: %s", result.output)
+        else:
+            indexed += 1
+
+    print(f"[index] indexed {indexed} files, skipped {skipped} — wing={active_wing}")
+
+    # Invalidate graph cache once after all files (not per-file)
+    try:
+        from mempalace.palace_graph import invalidate_graph_cache
+        invalidate_graph_cache()
+    except Exception:
+        pass
+
+    if not getattr(args, "no_closets", False):
+        try:
+            from mempalace.closet_llm import regenerate_closets, LLMConfig
+            cfg_base = load_config()
+            svc_id = cfg_base.get("service_id") or next(iter(SUPPORTED_SERVICES))
+            svc = SUPPORTED_SERVICES.get(svc_id, next(iter(SUPPORTED_SERVICES.values())))
+            api_key = resolve_api_key(svc_id, prompt_if_missing=False) or ""
+            model = cfg_base.get("model") or svc["default_model"]
+            cfg = None
+            if api_key:
+                cfg = LLMConfig(endpoint=svc["base_url"], key=api_key, model=model)
+            flavor = "LLM" if cfg else "regex"
+            print(f"[index] building closets for wing={active_wing} ({flavor})…")
+            regenerate_closets(str(palace_path), wing=active_wing, cfg=cfg)
+            print("[index] closets done")
+        except Exception as e:
+            logger.warning("closet refresh failed: %s", e)
+
+    return 0
+
+
+def cmd_migrate_palace(args: argparse.Namespace) -> int:
+    """Tag existing conversation drawers with wing + room metadata."""
+    from .migrate import run_migration
+    from .memory.mempalace_store import _DEFAULT_PALACE, _DEFAULT_KENT_HOME
+
+    dry_run = getattr(args, "dry_run", False)
+    default_wing = getattr(args, "default_wing", "kent_default") or "kent_default"
+    regenerate = getattr(args, "regenerate_closets", False)
+
+    if dry_run:
+        print("[migrate] dry-run mode — no changes will be written")
+
+    stats = run_migration(
+        kent_home=_DEFAULT_KENT_HOME,
+        palace_path=_DEFAULT_PALACE,
+        default_wing=default_wing,
+        dry_run=dry_run,
+        regenerate_closets=regenerate,
+    )
+
+    if "error" in stats:
+        print(f"[migrate] error: {stats['error']}", file=sys.stderr)
+        return 1
+
+    print(f"[migrate] sessions scanned  : {stats['sessions_scanned']}")
+    print(f"[migrate] drawers to update : {stats['drawers_to_update']}")
+    print(f"[migrate] graph nodes unlocked: {stats['graph_nodes_unlocked']}")
+    if stats["wings_inferred"]:
+        print("[migrate] wings inferred:")
+        for wing, count in sorted(stats["wings_inferred"].items()):
+            print(f"  {wing}: {count} drawers")
+    if dry_run and stats["drawers_to_update"] > 0:
+        print("[migrate] re-run without --dry-run to apply")
+    elif not dry_run and stats["drawers_to_update"] > 0:
+        print("[migrate] done — run `kent viz` to confirm")
+    return 0
+
+
 def cmd_scout(args: argparse.Namespace) -> int:
     """Cron entrypoint: analyze signals, append new suggestions, print 1-line summary."""
     from .training.scout import analyze
@@ -1649,6 +1907,22 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
                 print(f"  drawers    : {status.get('total_drawers', '?')}")
             except Exception as e:
                 print(f"  drawers    : <error: {e}>")
+            try:
+                from mempalace.palace import get_collection
+                from .memory.wings import read_active_wing
+                from .memory.mempalace_store import _DEFAULT_KENT_HOME
+                col = get_collection(str(palace), create=False)
+                aw = read_active_wing(home=_DEFAULT_KENT_HOME)
+                batch = col.get(where={"wing": aw}, include=["metadatas"], limit=10_000)
+                metas = batch.get("metadatas") or []
+                room_counts: dict[str, int] = {}
+                for m in metas:
+                    r = (m or {}).get("room") or ""
+                    if r:
+                        room_counts[r] = room_counts.get(r, 0) + 1
+                print(f"  rooms_in_active_wing: {dict(sorted(room_counts.items())) or 0}")
+            except Exception as e:
+                print(f"  rooms_in_active_wing: <error: {e}>")
             try:
                 mtimes = [p.stat().st_mtime for p in palace.rglob("*") if p.is_file()]
                 if mtimes:
@@ -2341,6 +2615,46 @@ def _build_parser() -> argparse.ArgumentParser:
     p_train_auto.add_argument("--suggestion-id", dest="suggestion_id", required=True, help="ID from train suggest")
     p_train_auto.add_argument("--pair", default=None, metavar="ACTOR+CRITIC")
     p_train_auto.set_defaults(func=cmd_train, train_command="auto")
+
+    # `kent index <path>`
+    p_index = sub.add_parser("index", help="Index a working tree's source files as code drawers")
+    p_index.add_argument("path", nargs="?", default=".", help="Root directory to index (default: .)")
+    p_index.add_argument(
+        "--set-wing",
+        dest="set_wing",
+        action="store_true",
+        help="Auto-detect project name and set it as the active wing",
+    )
+    p_index.add_argument(
+        "--no-closets",
+        dest="no_closets",
+        action="store_true",
+        help="Skip closet rebuild after indexing",
+    )
+    p_index.set_defaults(func=cmd_index)
+
+    # `kent migrate-palace`
+    p_migrate = sub.add_parser("migrate-palace", help="Tag existing drawers with wing + room metadata")
+    p_migrate.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Report what would change without writing",
+    )
+    p_migrate.add_argument(
+        "--default-wing",
+        dest="default_wing",
+        default="kent_default",
+        metavar="WING",
+        help="Wing to assign when no diary matches (default: kent_default)",
+    )
+    p_migrate.add_argument(
+        "--regenerate-closets",
+        dest="regenerate_closets",
+        action="store_true",
+        help="Rebuild closets for each touched wing after migration",
+    )
+    p_migrate.set_defaults(func=cmd_migrate_palace)
 
     # `kent scout`  (cron entrypoint)
     p_scout = sub.add_parser("scout", help="Analyze signals and surface training suggestions (cron-safe)")

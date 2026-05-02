@@ -129,6 +129,8 @@ def _build_discord_registry(
     system_prompt: str | None = None,
 ) -> ToolRegistry:
     """Build a ToolRegistry containing standard kent tools + Discord tools."""
+    from ..builtin.closet_refresh import ClosetRefresh
+    from ..builtin.code_drawer import CodeDrawer
     from ..builtin.diary_write import DiaryWrite
     from ..builtin.discord_react import DiscordReact
     from ..builtin.discord_read_history import DiscordReadHistory
@@ -147,6 +149,17 @@ def _build_discord_registry(
     from ..builtin.web_fetch import WebFetch
     from ..builtin.web_search import WebSearch
 
+    # Pull LLM creds off the configured client so closet_refresh can call the LLM.
+    base_url = api_key = model = None
+    try:
+        client = getattr(llm, "client", None)
+        if client is not None:
+            base_url = str(getattr(client, "base_url", "")) or None
+            api_key = getattr(client, "api_key", None) or None
+        model = getattr(llm, "model", None)
+    except Exception:
+        pass
+
     registry = ToolRegistry()
     registry.register(WebSearch())
     registry.register(WebFetch())
@@ -159,6 +172,11 @@ def _build_discord_registry(
     registry.register(DiaryWrite(memory_store))
     registry.register(SetWing(memory_store))
     registry.register(TunnelCreate())
+    registry.register(CodeDrawer(memory_store.palace_path, memory_store.active_wing))
+    registry.register(ClosetRefresh(
+        memory_store.palace_path, memory_store.active_wing,
+        base_url=base_url, api_key=api_key, model=model,
+    ))
 
     registry.register(DiscordSend(bot=bot, default_channel_id=default_channel_id))
     registry.register(DiscordReact(bot=bot, default_channel_id=default_channel_id))

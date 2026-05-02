@@ -7,6 +7,8 @@ from .memory_recall_here import MemoryRecallHere
 from .diary_write import DiaryWrite
 from .set_wing import SetWing
 from .task_boundary import TaskStart, TaskEnd
+from .code_drawer import CodeDrawer
+from .closet_refresh import ClosetRefresh
 
 __all__ = [
     "Spawn",
@@ -21,4 +23,6 @@ __all__ = [
     "SetWing",
     "TaskStart",
     "TaskEnd",
+    "CodeDrawer",
+    "ClosetRefresh",
 ]

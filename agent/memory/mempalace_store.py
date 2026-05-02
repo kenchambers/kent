@@ -19,6 +19,38 @@ logger = logging.getLogger(__name__)
 # slightly-stale state and don't need locking.
 _SWEEP_LOCK = threading.Lock()
 
+# Track wings we've already emitted a graph-cache invalidation for this process.
+# Used to limit graph invalidation to the *first* turn in a new wing (cheap check).
+_INVALIDATED_WINGS: set[str] = set()
+
+
+def _tag_session_drawers(
+    palace_path: Path,
+    session_id: str,
+    message_uuids: list[str],
+    *,
+    wing: str,
+    room: str,
+) -> None:
+    """Post-tag drawer metadata with wing+room after sweep."""
+    try:
+        from mempalace.palace import get_collection
+        from mempalace.sweeper import _drawer_id_for_message
+
+        col = get_collection(str(palace_path), create=False)
+        ids = [_drawer_id_for_message(session_id, u) for u in message_uuids]
+        existing = col.get(ids=ids, include=["metadatas"])
+        merged = []
+        for m in (existing.get("metadatas") or []):
+            m = dict(m or {})
+            m["wing"] = wing
+            m["room"] = room
+            merged.append(m)
+        if merged:
+            col.update(ids=existing.get("ids") or [], metadatas=merged)
+    except Exception:
+        logger.warning("_tag_session_drawers failed", exc_info=True)
+
 _TRANSCRIPT_BASE = Path(
     os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
 ) / "kent" / "transcripts"
@@ -77,15 +109,28 @@ class MemPalaceStore:
         self._active_wing = clean
         write_active_wing(clean, home=self._kent_home)
 
-    def record_turn(self, messages: list["Message"], *, session_id: str) -> None:
+    def record_turn(self, messages: list["Message"], *, session_id: str, room: str = "conversation") -> None:
         if not messages:
             return
         try:
             from mempalace.sweeper import sweep
 
-            append_messages(self._transcript_path, messages, session_id=session_id)
+            uuids = append_messages(self._transcript_path, messages, session_id=session_id)
             with _SWEEP_LOCK:
                 sweep(str(self._transcript_path), str(self._palace_path), source_label="kent")
+                _tag_session_drawers(
+                    self._palace_path, session_id, uuids,
+                    wing=self._active_wing, room=room,
+                )
+                # Invalidate the graph cache once per wing per process so kent viz
+                # reflects new drawers within ~1 s rather than waiting out the TTL.
+                if self._active_wing not in _INVALIDATED_WINGS:
+                    try:
+                        from mempalace.palace_graph import invalidate_graph_cache
+                        invalidate_graph_cache()
+                        _INVALIDATED_WINGS.add(self._active_wing)
+                    except Exception:
+                        logger.debug("graph cache invalidation failed", exc_info=True)
         except Exception:
             logger.warning("MemPalaceStore.record_turn failed", exc_info=True)
 
