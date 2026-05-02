@@ -1019,8 +1019,8 @@ async def _repl(choice: StartupChoice, *, wing_override: str | None = None) -> N
         system_prompt=system_prompt,
     ))
 
-    # Scout: opt in via KENT_SCOUT_ENABLED=1
-    scout_enabled = os.environ.get("KENT_SCOUT_ENABLED", "").strip() in ("1", "true", "yes")
+    # Scout: always on (opt out via KENT_SCOUT_ENABLED=0)
+    scout_enabled = os.environ.get("KENT_SCOUT_ENABLED", "true").lower() not in ("0", "false", "no")
     collector: Any = None
     if scout_enabled:
         try:

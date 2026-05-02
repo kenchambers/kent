@@ -169,8 +169,9 @@ class Spawn:
                     parent_abort_event=abort,
                 ):
                     if isinstance(ev, AssistantMessageComplete):
-                        if ev.message.content:
-                            final_text = ev.message.content
+                        content = (ev.message.content or "").strip()
+                        if content:
+                            final_text = content
                     elif isinstance(ev, Terminal):
                         terminal_reason = ev.reason
                         break
@@ -182,6 +183,9 @@ class Spawn:
                 terminal_reason = "failed"
                 logger.warning("spawn worker %s failed", task_id, exc_info=True)
             finally:
+                if not final_text.strip():
+                    logger.warning("worker %s produced no output", task_id)
+                    terminal_reason = "no_output"
                 if watcher is not None and not watcher.done():
                     watcher.cancel()
                 status = _status_from(terminal_reason)
