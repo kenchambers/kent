@@ -487,10 +487,11 @@ class DiscordGateway:
                 line = f"task `{tid}` {status}"
                 if summary:
                     line += f" — {summary[:80]}"
-                try:
-                    await channel.send(line)
-                except Exception:
-                    logger.exception("notifier: send failed for channel %d", channel_id)
+                if line.strip():
+                    try:
+                        await channel.send(line)
+                    except Exception:
+                        logger.exception("notifier: send failed for channel %d", channel_id)
             await asyncio.sleep(0)
 
 
@@ -544,6 +545,7 @@ class DiscordGateway:
         cid = int(message.channel.id)
         session_id = _channel_session_id(cid)
         pending_msgs, drained_ids = INBOX.drain(session_id)
+        pending_msgs = [m for m in pending_msgs if (m.get("content") or "").strip()]
         for tid in drained_ids:
             REGISTRY.drop(tid)
 
@@ -673,6 +675,7 @@ class DiscordGateway:
 
         session_id = _channel_session_id(channel_id)
         pending_msgs, drained_ids = INBOX.drain(session_id)
+        pending_msgs = [m for m in pending_msgs if (m.get("content") or "").strip()]
         for tid in drained_ids:
             REGISTRY.drop(tid)
 
