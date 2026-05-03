@@ -50,7 +50,7 @@ from .events import (
     ToolCallComplete,
     ToolResult,
 )
-from .llm import LLM, OpenAICompatibleLLM
+from .llm import LLM, OpenAICompatibleLLM, FallbackLLM
 from .loop import run
 from .orchestration import INBOX, REGISTRY
 from .tools import ToolRegistry
@@ -81,7 +81,11 @@ SUPPORTED_SERVICES: dict[str, dict[str, Any]] = {
         "api_key_env": "ATLASCLOUD_API_KEY",
         "default_model": "qwen/qwen3.6-35b-a3b",
         "default_context_window": 131_072,
-        "models": ["qwen/qwen3.6-35b-a3b"],
+        "models": [
+            "qwen/qwen3.6-35b-a3b",
+            "deepseek-ai/deepseek-v4-pro",
+            "moonshotai/kimi-k2.6",
+        ],
     },
 }
 
@@ -216,6 +220,7 @@ class StartupChoice:
     api_key: str
     context_window: int
     critic_model: str | None = None  # None = critic disabled
+    fallback_model: str | None = None  # None = no fallback
     # NOTE: plan §"Files to modify" line 109 mentioned extending this struct
     # with training fields. We chose to keep training config out of the
     # interactive REPL path — `kent train` reads its own --pair / --rounds /
@@ -321,7 +326,84 @@ def _prompt(label: str, default: str | None = None, *, secret: bool = False) -> 
     return value
 
 
+def _interactive_select(label: str, options: list[str], default: str) -> str | None:
+    """Arrow-key picker. Returns the chosen option, or None if unavailable
+    (non-tty, no termios — caller should fall back to typed input)."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return None  # Windows / non-POSIX
+    if os.environ.get("KENT_NO_PICKER") == "1":
+        return None
+
+    try:
+        idx = options.index(default)
+    except ValueError:
+        idx = 0
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    hint = _ui.c(_ui.DIM, "(↑/↓ or j/k to move, space/enter to select, q to cancel)")
+    print(f"{label} {hint}")
+
+    def render(first: bool) -> None:
+        if not first:
+            sys.stdout.write(f"\033[{len(options)}A")  # up N lines
+        for i, opt in enumerate(options):
+            if i == idx:
+                line = _ui.c(_ui.CYAN, "  ▸ ") + _ui.style(opt, _ui.BOLD)
+            else:
+                line = "    " + _ui.c(_ui.GREY, opt)
+            sys.stdout.write("\033[2K" + line + "\n")  # clear line + write
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033[?25l")  # hide cursor
+        sys.stdout.flush()
+        render(first=True)
+        import select as _select
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\x03":  # Ctrl-C
+                raise KeyboardInterrupt
+            if ch in (b"q", b"Q"):
+                return None
+            if ch == b"\x1b":
+                # Bare ESC cancels; ESC+[A/B is an arrow sequence.
+                r, _, _ = _select.select([fd], [], [], 0.001)
+                if not r:
+                    return None
+                seq = os.read(fd, 2)
+                if seq == b"[A":
+                    idx = (idx - 1) % len(options)
+                    render(first=False)
+                elif seq == b"[B":
+                    idx = (idx + 1) % len(options)
+                    render(first=False)
+                continue
+            if ch in (b"\r", b"\n", b" "):
+                return options[idx]
+            if ch in (b"k", b"K"):
+                idx = (idx - 1) % len(options)
+                render(first=False)
+            elif ch in (b"j", b"J"):
+                idx = (idx + 1) % len(options)
+                render(first=False)
+    finally:
+        sys.stdout.write("\033[?25h")  # show cursor
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
 def _prompt_choice(label: str, options: list[str], default: str) -> str:
+    picked = _interactive_select(label, options, default)
+    if picked is not None:
+        print(_ui.c(_ui.DIM, f"  → {picked}"))
+        return picked
     while True:
         rendered = ", ".join(options)
         value = _prompt(f"{label} ({rendered})", default=default)
@@ -354,6 +436,16 @@ def gather_startup_choice(*, save: bool = True) -> StartupChoice:
         default=cfg.get("model", service["default_model"]),
     )
 
+    fallback_options = ["none"] + [m for m in service["models"] if m != model]
+    saved_fallback = cfg.get("fallback_model")
+    fallback_default = saved_fallback if saved_fallback in fallback_options else "none"
+    fallback_choice = _prompt_choice(
+        "Fallback model (used if primary fails before streaming)",
+        fallback_options,
+        default=fallback_default,
+    )
+    fallback_model: str | None = None if fallback_choice == "none" else fallback_choice
+
     api_key = resolve_api_key(service_id, prompt_if_missing=True)
     if not api_key:
         env_key = service["api_key_env"]
@@ -384,6 +476,7 @@ def gather_startup_choice(*, save: bool = True) -> StartupChoice:
             "service_id": service_id,
             "model": model,
             "critic_model": critic_model,
+            "fallback_model": fallback_model,
         })
 
     return StartupChoice(
@@ -394,6 +487,7 @@ def gather_startup_choice(*, save: bool = True) -> StartupChoice:
         api_key=api_key,
         context_window=service["default_context_window"],
         critic_model=critic_model,
+        fallback_model=fallback_model,
     )
 
 
@@ -421,13 +515,22 @@ def build_registry() -> ToolRegistry:
     return registry
 
 
-def _make_llm(choice: StartupChoice) -> OpenAICompatibleLLM:
-    return OpenAICompatibleLLM(
+def _make_llm(choice: StartupChoice) -> LLM:
+    primary = OpenAICompatibleLLM(
         base_url=choice.base_url,
         api_key=choice.api_key,
         model=choice.model,
         context_window=choice.context_window,
     )
+    if not choice.fallback_model or choice.fallback_model == choice.model:
+        return primary
+    fallback = OpenAICompatibleLLM(
+        base_url=choice.base_url,
+        api_key=choice.api_key,
+        model=choice.fallback_model,
+        context_window=choice.context_window,
+    )
+    return FallbackLLM(primary=primary, fallback=fallback)
 
 
 def _make_critic_llm(choice: StartupChoice) -> OpenAICompatibleLLM | None:
@@ -1134,6 +1237,15 @@ def cmd_repl(args: argparse.Namespace) -> int:
     _print_web_search_notice()
     choice = gather_startup_choice()
     wing_override = _resolve_wing(args)
+    print()
+    print(_ui.rule())
+    print(
+        "  "
+        + _ui.style("entering REPL", _ui.BOLD)
+        + _ui.c(_ui.DIM, " — type /help for commands, /exit to quit")
+    )
+    print(_ui.rule())
+    print()
     try:
         asyncio.run(_repl(choice, wing_override=wing_override))
     except KeyboardInterrupt:
@@ -1167,6 +1279,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         api_key=api_key,
         context_window=service["default_context_window"],
         critic_model=cfg.get("critic_model"),
+        fallback_model=cfg.get("fallback_model"),
     )
     llm = _make_llm(choice)
     critic_llm = _make_critic_llm(choice)

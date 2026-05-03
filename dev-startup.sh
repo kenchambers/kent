@@ -645,12 +645,10 @@ fi
 echo
 print_palace_glyph
 
-# ---------- 5. drop into REPL --------------------------------------------- #
-
-printf "${C_DIM}${C_GREY}  ─────────────────────────────────────────────────────────────${C_RESET}\n"
-typeout "  ${C_BOLD}entering REPL${C_RESET}${C_DIM} — type /help for commands, /exit to quit${C_RESET}" 0.008
-printf "${C_DIM}${C_GREY}  ─────────────────────────────────────────────────────────────${C_RESET}\n"
-echo
+# ---------- 5. launch kent ------------------------------------------------- #
+# `kent` prints its own banner, runs the [llm setup] wizard, then prints
+# its own "entering REPL" rule once setup is done. Don't pre-announce the
+# REPL here — the wizard still has to run.
 
 # Run in foreground (NOT exec) so the EXIT trap fires and viz cleanup runs
 # when the REPL exits. `set -e` is suppressed for this call so Ctrl-C in
