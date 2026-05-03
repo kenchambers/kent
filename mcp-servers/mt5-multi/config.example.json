@@ -1,0 +1,11 @@
+{
+  "accounts": {
+    "ftmo_10k": {
+      "login": 521005217,
+      "password": "change_me",
+      "server": "FTMO-Server2",
+      "path": "C:\\MT5_Accounts\\ftmo_10k\\terminal64.exe",
+      "timeout": 60000
+    }
+  }
+}
