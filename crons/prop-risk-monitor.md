@@ -40,10 +40,10 @@ approached. It's an **emotional firewall**.
 | **Timezone** | America/Chicago |
 | **Model** | `sonnet` (Sonnet 4.6) for orchestration; per-magic gatekeeper escalates to `opus` |
 | **Timeout** | 900 s |
-| **Status** | **DISABLED 2026-05-02 per operator** — removed from `~/.claude/scheduled_tasks.json`. The runtime had only ever registered the predecessor `6898bab7` (the planned replacement `c80372b0` lived in the catalog but was never registered in the runtime store); `6898bab7` was the entry actually firing every 2h until disable. |
+| **Status** | **ACTIVE** — re-enabled 2026-05-03 per operator (briefly disabled 2026-05-02). The runtime entry is `6898bab7` (the planned replacement `c80372b0` lives in the catalog but has never been registered; `6898bab7` is what actually fires every 2h). |
 | **Discord channel** | `1467304221362622555` |
 
-To re-enable: register the `c80372b0` entry from `cron_instructions/claude_code_crons.json` via `CronCreate` with `durable: true`.
+Toggle history: disable = remove `6898bab7` from `~/.claude/scheduled_tasks.json`; enable = restore it (the entry is preserved in dated backups under `~/.claude/scheduled_tasks.json.bak.*`).
 
 The cron prompt is short — it just runs the analyzer script, formats the
 output, and posts. All real logic lives in `scripts/prop_risk_*.py` and the
